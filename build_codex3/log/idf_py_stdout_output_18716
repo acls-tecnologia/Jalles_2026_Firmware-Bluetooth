@@ -1,0 +1,18 @@
+Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=C:\Espressif\tools\python\v5.5.4\venv\Scripts\python.exe -DESP_PLATFORM=1 -DCMAKE_MAKE_PROGRAM=C:/Espressif/tools/ninja/1.12.1/ninja.exe -DCMAKE_C_COMPILER=C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20251107/xtensa-esp-elf/bin/xtensa-esp32-elf-gcc.exe -DCMAKE_CXX_COMPILER=C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20251107/xtensa-esp-elf/bin/xtensa-esp32-elf-g++.exe -DCMAKE_ASM_COMPILER=C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20251107/xtensa-esp-elf/bin/xtensa-esp32-elf-gcc.exe -DCCACHE_ENABLE=0 C:\Users\engen\Documents\chat teste\Jalles_2026_Firmware-Bluetooth
+-- IDF_TARGET is not set, guessed 'esp32' from sdkconfig 'C:/Users/engen/Documents/chat teste/Jalles_2026_Firmware-Bluetooth/sdkconfig'
+-- Found Git: C:/Program Files/Git/cmd/git.exe (found version "2.53.0.windows.1")
+-- git rev-parse returned 'fatal: detected dubious ownership in repository at 'C:/esp/v5.5.4/esp-idf'
+'C:/esp/v5.5.4/esp-idf' is owned by:
+	Nicolas/engen (S-1-5-21-1729684715-482485536-1666024242-1001)
+but the current user is:
+	Nicolas/CodexSandboxOffline (S-1-5-21-1729684715-482485536-1666024242-1023)
+To add an exception for this directory, call:
+
+	git config --global --add safe.directory C:/esp/v5.5.4/esp-idf'
+-- Minimal build - OFF
+-- The C compiler identification is unknown
+-- The CXX compiler identification is unknown
+-- The ASM compiler identification is unknown
+-- Found assembler: xtensa-esp32-elf-gcc
+-- Warning: Did not find file Compiler/-ASM
+-- Configuring incomplete, errors occurred!
