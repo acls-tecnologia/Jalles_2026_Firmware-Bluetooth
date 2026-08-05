@@ -14,6 +14,11 @@
 static const char *TAG_WIFI = "wifi_task"; // Tag para logs da task Wi-Fi
 static TaskHandle_t taskWifi = NULL;       // Handle da task Wi-Fi
 static TaskHandle_t taskLogin = NULL;      // Handle da task de login
+static QueueHandle_t vazao_sync_queue = NULL;
+static SemaphoreHandle_t pwm_state_mutex = NULL;
+
+#define PWM_NVS_NAMESPACE "pwm_cfg"
+#define PWM_NVS_SETPOINT_KEY "set_x100"
 
 #define BLE_STARTUP_WINDOW_MS (20 * 1000U)
 
@@ -25,6 +30,14 @@ RTC_DATA_ATTR int g_last_restart_marker = 0;
 
 static const char *TAG_BOMBA = "BOMBA"; // Tag para logs da task de bomba
 static int g_bomba_controle_id[MAX_BOMBAS] = {0, 0, 0};
+static portMUX_TYPE g_bomba_state_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool g_bomba_safety_ready = false;
+static volatile bool g_bomba_emergency_lockout = false;
+static bool g_i2c_tasks_started = false;
+static bool g_lora_started = false;
+static volatile bool g_lora_setup_ok = false;
+static uint8_t g_lora_transaction_failures = 0;
+static int64_t g_lora_last_start_try_ms = -30000;
 
 // Protótipo de Funções
 esp_err_t Port_config(i2c_master_bus_handle_t *bus_handle, i2c_master_dev_handle_t *mcp_handle,
@@ -60,6 +73,7 @@ void watchdog_callback(void *arg);             // Protótipo da função de call
 void start_watchdog_timer();                   // Protótipo da função de início do timer do watchdog
 void reset_watchdog_timer();                   // Protótipo da função de reset do timer do watchdog
 static void lora_setup_tanque(void);           // Protótipo da função de configuração do LoRa para o tanque
+static bool tanque_lora_recover_radio(void);
 bool tanque_send_to_gtw_ack(uint16_t src_tank_id, uint16_t gtw_id, const char *msg, uint8_t has_bomba,
                             uint16_t bomba_id); // Protótipo da função de envio de mensagem para a gateway com ACK
 
@@ -92,6 +106,14 @@ static bool lora_enqueue_alerta_codigo(uint8_t codigo, int unidade_id, int bomba
 static bool lora_enqueue_alerta_codigo_controle(uint8_t codigo, int unidade_id, int bomba_id, int controle_id, int pct);
 static bool lora_enqueue_bomba_controle_false(int controle_id);
 static void log_ble_config_missing(bool wifi_ok, bool cfg_ok);
+static void i2c_init_task(void *pv);
+static void i2c_cleanup_partial(void);
+static void start_i2c_dependent_tasks(void);
+static void task_wdt_register_current(const char *task_name);
+static void task_wdt_kick(void);
+static void bomba_atualizar_entradas_seguranca(const int *lr_bombas, const int *st_bombas, int emg_tanque, int n);
+static esp_err_t pwm_nvs_salvar_setpoint(float percent);
+static bool pwm_nvs_carregar_setpoint(float *out_percent);
 
 void vazao_sync_task(void *pv);
 static bool existe_bomba_ligada_ou_desejada(void);
@@ -99,6 +121,17 @@ void pwm_agendar_sync_vazao(int bomba_id, float percent);
 
 uint16_t tanque_lora_get_device_id(void) {
     return (g_cfg.tanque_id > 0) ? (uint16_t)g_cfg.tanque_id : (uint16_t)PROVISION_TANQUE_ID;
+}
+
+static void task_wdt_register_current(const char *task_name) {
+    esp_err_t err = esp_task_wdt_add(NULL);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE("TASK_WDT", "Falha ao registrar %s: %s", task_name, esp_err_to_name(err));
+    }
+}
+
+static void task_wdt_kick(void) {
+    (void)esp_task_wdt_reset();
 }
 
 // ====================================================================================
@@ -320,6 +353,16 @@ void app_main(void) {
         ESP_LOGI("Main", "Mutex para o Lora criado com sucesso");
     }
 
+    pwm_state_mutex = xSemaphoreCreateMutex();
+    if (pwm_state_mutex == NULL) {
+        ESP_LOGE("Main", "Falha ao criar mutex do setpoint PWM");
+    }
+
+    if (!i2c_semaphore || !MutexHTTP || !MutexLora || !pwm_state_mutex) {
+        ESP_LOGE("MAIN", "Recurso critico do sistema nao foi criado; reiniciando");
+        esp_restart();
+    }
+
     ESP_LOGI(">>>> Main", " Barramento I2C e dispositivos configurados com sucesso");
 
     // Cria o event group do sistema, se ainda não foi criado
@@ -332,7 +375,7 @@ void app_main(void) {
     }
 
     // Garante estado inicial offline no boot
-    xEventGroupClearBits(sys_event_group, SYS_NET_ONLINE_BIT | SYS_AUTH_OK_BIT | SYS_WS_OK_BIT);
+    xEventGroupClearBits(sys_event_group, SYS_NET_ONLINE_BIT | SYS_AUTH_OK_BIT | SYS_WS_OK_BIT | SYS_WS_RESTART_BIT);
 
     if (!device_configured) {
         ESP_LOGW("MAIN", "Dispositivo sem configuracao completa; abrindo BLE sem timeout");
@@ -345,8 +388,15 @@ void app_main(void) {
         start_watchdog_timer();
         while (1) {
             reset_watchdog_timer();
-            rtc_wdt_feed_raw();
             vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+    }
+
+    if (g_cfg.perfil == TANQUE_FULL) {
+        vazao_sync_queue = xQueueCreate(1, sizeof(int));
+        if (!vazao_sync_queue) {
+            ESP_LOGE("MAIN", "Falha ao criar fila de sincronizacao da vazao");
+            esp_restart();
         }
     }
 
@@ -360,40 +410,37 @@ void app_main(void) {
     }
 
     ESP_LOGI(">>>> Main", "Criando task do Wi-Fi...");
-    xTaskCreate(wifi_task, "wifi_task", 6096 * 2, NULL, 7, &taskWifi);
+    if (xTaskCreate(wifi_task, "wifi_task", 6096 * 2, NULL, 7, &taskWifi) != pdPASS) {
+        ESP_LOGE("MAIN", "Falha ao criar wifi_task");
+        esp_restart();
+    }
     vTaskDelay(pdMS_TO_TICKS(200));
 
     ESP_LOGI(">>>> Main", "Criando task de Login...");
-    xTaskCreate(login_task, "login_task", 8192, NULL, 5, &taskLogin);
-
-    ESP_LOGI(">>>> Main", "Criando task de websocket...");
-    xTaskCreate(ws_manager_task, "ws_manager", 4096, NULL, 5, NULL);
-
-    bool enable_mcp = (g_cfg.perfil == TANQUE_FULL);
-
-    esp_err_t ret = Port_config(&bus_handle, &mcp_handle, &ads_handle, enable_mcp);
-    if (ret != ESP_OK) {
-        ESP_LOGE("MAIN", "Falha Port_config. Sistema continua com LoRa ativo.");
-    } else {
-        if (g_cfg.perfil == TANQUE_FULL) {
-            xTaskCreate(ler_portas_task, "ler_portas_task", 4096, NULL, 5, NULL);
-            xTaskCreate(bombas_task, "bombas_task", 4096, NULL, 5, NULL);
-            xTaskCreate(corrente_task, "corrente_task", 4096, NULL, 5, NULL);
-            xTaskCreate(vazao_sync_task, "vazao_sync_task", 4096, NULL, 5, NULL);
-        }
-
-        xTaskCreatePinnedToCore(nivel_task, "nivel_task", 8192, NULL, 5, NULL, 1);
-        xTaskCreate(lora_boot_snapshot_task, "lora_boot_snapshot", 4096, NULL, 4, NULL);
+    if (xTaskCreate(login_task, "login_task", 8192, NULL, 5, &taskLogin) != pdPASS) {
+        ESP_LOGE("MAIN", "Falha ao criar login_task");
+        esp_restart();
     }
 
-    start_watchdog_timer(); // Inicia o watchdog de software
+    ESP_LOGI(">>>> Main", "Criando task de websocket...");
+    if (xTaskCreate(ws_manager_task, "ws_manager", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE("MAIN", "Falha ao criar ws_manager");
+        esp_restart();
+    }
+
+    if (xTaskCreate(i2c_init_task, "i2c_init", 6144, NULL, 6, NULL) != pdPASS) {
+        ESP_LOGE("MAIN", "Falha ao criar task de inicializacao/recuperacao I2C");
+        esp_restart();
+    }
+
+    start_watchdog_timer(); // Registra app_main no Task Watchdog
 
     while (1) {
 #if DEBUG_MODE
         ESP_LOGI("MAIN", "Executando normalmente...");
 #endif
         reset_watchdog_timer(); // Reseta o timer para evitar reset
-        rtc_wdt_feed_raw();     // watchdog de hardware
+        lora_start_if_needed();
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
@@ -420,6 +467,7 @@ esp_err_t Port_config(i2c_master_bus_handle_t *bus_handle, i2c_master_dev_handle
     bool mcp_add_ok = false;  // indica se o dispositivo MCP23017 foi adicionado com sucesso
     bool mcp_init_ok = false; // indica se o dispositivo MCP23017 foi inicializado com sucesso
     bool ads_dev_ok = false;  // indica se o dispositivo ADS1115 foi adicionado com sucesso
+    bool ads_init_ok = false; // indica se o ADS1115 respondeu e aceitou a configuracao
 
     int retry_count = 0;      // contador de tentativas
     esp_err_t ret = ESP_FAIL; // código de retorno da função
@@ -589,7 +637,12 @@ esp_err_t Port_config(i2c_master_bus_handle_t *bus_handle, i2c_master_dev_handle
     }
 
     // Configura o ADS1115 (só chega aqui se ads_dev_ok == true)
-    _4a20ma = ads1115_config(*bus_handle, 0x49, *ads_handle);
+    ret = ads1115_init(&_4a20ma, *ads_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_Port_config, "ADS1115 adicionado, mas falhou ao responder/configurar: %s", esp_err_to_name(ret));
+        goto resumo;
+    }
+    ads_init_ok = true;
     ads1115_set_max_ticks(&_4a20ma, 100);
     ads1115_set_pga(&_4a20ma, ADS1115_FSR_2_048);
     ads1115_set_sps(&_4a20ma, ADS1115_SPS_128);
@@ -608,8 +661,9 @@ resumo:
         ESP_LOGI(TAG_Port_config, " MCP23017 (init)     : IGNORADO (perfil NIVEL)");
     }
     ESP_LOGI(TAG_Port_config, " ADS1115 (device)    : %s", ads_dev_ok ? "OK" : "FALHOU");
+    ESP_LOGI(TAG_Port_config, " ADS1115 (init)      : %s", ads_init_ok ? "OK" : "FALHOU");
 
-    bool sucesso_total = i2c_ok && ads_dev_ok && (!enable_mcp || (mcp_add_ok && mcp_init_ok));
+    bool sucesso_total = i2c_ok && ads_dev_ok && ads_init_ok && (!enable_mcp || (mcp_add_ok && mcp_init_ok));
     ret = sucesso_total ? ESP_OK : ESP_FAIL;
 
     if (sucesso_total) {
@@ -620,28 +674,117 @@ resumo:
         ret = ESP_FAIL;
     }
 
-    ledc_timer_config_t ledc_timer = {.speed_mode = PWM_MODE,
-                                      .timer_num = PWM_TIMER,
-                                      .duty_resolution = PWM_RES,
-                                      .freq_hz = PWM_FREQ_HZ,
-                                      .clk_cfg = LEDC_AUTO_CLK};
+    if (sucesso_total) {
+        ledc_timer_config_t ledc_timer = {.speed_mode = PWM_MODE,
+                                          .timer_num = PWM_TIMER,
+                                          .duty_resolution = PWM_RES,
+                                          .freq_hz = PWM_FREQ_HZ,
+                                          .clk_cfg = LEDC_AUTO_CLK};
 
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+        ret = ledc_timer_config(&ledc_timer);
+        if (ret != ESP_OK) {
+            ESP_LOGE("PWM", "Falha ao configurar timer PWM: %s", esp_err_to_name(ret));
+            return ret;
+        }
 
-    ledc_channel_config_t ledc_channel = {.speed_mode = PWM_MODE,
-                                          .channel = PWM_CHANNEL,
-                                          .timer_sel = PWM_TIMER,
-                                          .intr_type = LEDC_INTR_DISABLE,
-                                          .gpio_num = PWM_GPIO,
-                                          .duty = 0,
-                                          .hpoint = 0};
+        ledc_channel_config_t ledc_channel = {.speed_mode = PWM_MODE,
+                                              .channel = PWM_CHANNEL,
+                                              .timer_sel = PWM_TIMER,
+                                              .intr_type = LEDC_INTR_DISABLE,
+                                              .gpio_num = PWM_GPIO,
+                                              .duty = 0,
+                                              .hpoint = 0};
 
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+        ret = ledc_channel_config(&ledc_channel);
+        if (ret != ESP_OK) {
+            ESP_LOGE("PWM", "Falha ao configurar canal PWM: %s", esp_err_to_name(ret));
+            return ret;
+        }
 
-    ESP_LOGI("PWM", "PWM 4-20mA inicializado");
-    pwm_processar_novo_setpoint(0.0f);
+        ESP_LOGI("PWM", "PWM 4-20mA inicializado");
+
+        float setpoint_inicial = 0.0f;
+        if (pwm_nvs_carregar_setpoint(&setpoint_inicial)) {
+            ESP_LOGI("PWM_4A20", "Ultimo setpoint restaurado da NVS = %.2f%%", (double)setpoint_inicial);
+        } else {
+            ESP_LOGI("PWM_4A20", "Sem setpoint salvo na NVS; usando 0.00%%");
+        }
+
+        if (pwm_state_mutex)
+            xSemaphoreTake(pwm_state_mutex, portMAX_DELAY);
+        g_vazao_pwm_percent = setpoint_inicial;
+        if (pwm_state_mutex)
+            xSemaphoreGive(pwm_state_mutex);
+    }
 
     return ret;
+}
+
+static void i2c_cleanup_partial(void) {
+    if (ads_handle) {
+        (void)i2c_master_bus_rm_device(ads_handle);
+        ads_handle = NULL;
+    }
+
+    if (mcp_handle) {
+        (void)i2c_master_bus_rm_device(mcp_handle);
+        mcp_handle = NULL;
+    }
+
+    if (bus_handle) {
+        (void)i2c_del_master_bus(bus_handle);
+        bus_handle = NULL;
+    }
+
+    memset(&_4a20ma, 0, sizeof(_4a20ma));
+}
+
+static void start_i2c_dependent_tasks(void) {
+    if (g_i2c_tasks_started)
+        return;
+
+    if (g_cfg.perfil == TANQUE_FULL) {
+        if (xTaskCreate(ler_portas_task, "ler_portas_task", 4096, NULL, 5, NULL) != pdPASS ||
+            xTaskCreate(bombas_task, "bombas_task", 4096, NULL, 5, NULL) != pdPASS ||
+            xTaskCreate(corrente_task, "corrente_task", 4096, NULL, 5, NULL) != pdPASS ||
+            xTaskCreate(vazao_sync_task, "vazao_sync_task", 4096, NULL, 5, NULL) != pdPASS) {
+            ESP_LOGE("I2C_RECOVERY", "Falha ao criar uma task dependente do I2C; reiniciando");
+            esp_restart();
+        }
+    }
+
+    if (xTaskCreatePinnedToCore(nivel_task, "nivel_task", 8192, NULL, 5, NULL, 1) != pdPASS ||
+        xTaskCreate(lora_boot_snapshot_task, "lora_boot_snapshot", 4096, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE("I2C_RECOVERY", "Falha ao criar task de nivel/snapshot; reiniciando");
+        esp_restart();
+    }
+
+    g_i2c_tasks_started = true;
+}
+
+static void i2c_init_task(void *pv) {
+    (void)pv;
+    const bool enable_mcp = (g_cfg.perfil == TANQUE_FULL);
+    task_wdt_register_current("i2c_init");
+
+    while (!g_i2c_tasks_started) {
+        task_wdt_kick();
+        i2c_cleanup_partial();
+
+        esp_err_t err = Port_config(&bus_handle, &mcp_handle, &ads_handle, enable_mcp);
+        if (err == ESP_OK) {
+            ESP_LOGI("I2C_RECOVERY", "I2C recuperado/configurado; iniciando tasks dependentes");
+            start_i2c_dependent_tasks();
+            break;
+        }
+
+        ESP_LOGE("I2C_RECOVERY", "I2C indisponivel: %s; nova tentativa em 30 segundos", esp_err_to_name(err));
+        i2c_cleanup_partial();
+        vTaskDelay(pdMS_TO_TICKS(30000));
+    }
+
+    (void)esp_task_wdt_delete(NULL);
+    vTaskDelete(NULL);
 }
 
 // Função para imprimir informações da conexão Wi-Fi
@@ -906,10 +1049,14 @@ void login_task(void *pv) {
     int fail_count = 0;
     int initRST = 0;
     int64_t last_login_try_ms = 0;
+    int refresh_fail_count = 0;
+    int64_t token_refresh_due_ms = 0;
+    int64_t last_refresh_try_ms = 0;
 
     const int LOGIN_RETRY_MIN_MS = 5000;  // 5 s
     const int LOGIN_RETRY_MAX_MS = 60000; // 60 s
     const int LOOP_DELAY_MS = 1000;       // task roda a cada 1 s
+    const int64_t TOKEN_REFRESH_INTERVAL_MS = 20LL * 60LL * 60LL * 1000LL;
 
     while (1) {
         esp_task_wdt_reset();
@@ -931,9 +1078,53 @@ void login_task(void *pv) {
         // -------------------------------------------------
         // Já tem token -> mantém AUTH_OK
         // -------------------------------------------------
+        int64_t now_ms = esp_timer_get_time() / 1000;
+
         if (api_has_token()) {
             xEventGroupSetBits(sys_event_group, SYS_AUTH_OK_BIT);
             fail_count = 0;
+
+            if (token_refresh_due_ms == 0) {
+                token_refresh_due_ms = now_ms + TOKEN_REFRESH_INTERVAL_MS;
+                ESP_LOGI(TAG, "Renovacao preventiva ativada para daqui a 20 horas");
+            }
+
+            if (now_ms >= token_refresh_due_ms) {
+                int refresh_retry_ms = LOGIN_RETRY_MIN_MS;
+                if (refresh_fail_count > 0) {
+                    int shift = refresh_fail_count > 4 ? 4 : refresh_fail_count;
+                    refresh_retry_ms = LOGIN_RETRY_MIN_MS << shift;
+                    if (refresh_retry_ms > LOGIN_RETRY_MAX_MS)
+                        refresh_retry_ms = LOGIN_RETRY_MAX_MS;
+                }
+
+                if ((now_ms - last_refresh_try_ms) >= refresh_retry_ms) {
+                    last_refresh_try_ms = now_ms;
+                    ESP_LOGI(TAG, "Renovando token preventivamente...");
+
+                    esp_err_t refresh_err = ESP_ERR_TIMEOUT;
+                    if (xSemaphoreTake(MutexHTTP, pdMS_TO_TICKS(15000)) == pdTRUE) {
+                        refresh_err = api_login(API_USER, API_PASS);
+                        xSemaphoreGive(MutexHTTP);
+                    } else {
+                        ESP_LOGW(TAG, "Renovacao aguardando HTTP livre; MutexHTTP ocupado");
+                    }
+
+                    if (refresh_err == ESP_OK && api_has_token()) {
+                        token_refresh_due_ms = (esp_timer_get_time() / 1000) + TOKEN_REFRESH_INTERVAL_MS;
+                        last_refresh_try_ms = 0;
+                        refresh_fail_count = 0;
+                        xEventGroupSetBits(sys_event_group, SYS_WS_RESTART_BIT);
+                        ESP_LOGI(TAG, "Token renovado; WebSocket sera reconectado com o novo token");
+                    } else {
+                        if (refresh_fail_count < 10)
+                            refresh_fail_count++;
+                        ESP_LOGW(TAG, "Falha ao renovar token (%s); token atual mantido",
+                                 esp_err_to_name(refresh_err));
+                    }
+                }
+            }
+
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
@@ -948,8 +1139,6 @@ void login_task(void *pv) {
             if (retry_ms > LOGIN_RETRY_MAX_MS)
                 retry_ms = LOGIN_RETRY_MAX_MS;
         }
-
-        int64_t now_ms = esp_timer_get_time() / 1000;
 
         if ((now_ms - last_login_try_ms) < retry_ms) {
             vTaskDelay(pdMS_TO_TICKS(LOOP_DELAY_MS));
@@ -970,6 +1159,10 @@ void login_task(void *pv) {
 
         if (err == ESP_OK && api_has_token()) {
             ESP_LOGI(TAG, "Login OK");
+            token_refresh_due_ms = (esp_timer_get_time() / 1000) + TOKEN_REFRESH_INTERVAL_MS;
+            last_refresh_try_ms = 0;
+            refresh_fail_count = 0;
+            ESP_LOGI(TAG, "Renovacao preventiva ativada para daqui a 20 horas");
             if (initRST == 0) {
                 initRST = 1;
                 esp_reset_reason_t reset_reason = esp_reset_reason();
@@ -1012,9 +1205,21 @@ void login_task(void *pv) {
 void ws_manager_task(void *pv) {
     bool was_connected = false;
     bool is_connecting = false;
+    task_wdt_register_current("ws_manager");
 
     while (1) {
+        task_wdt_kick();
         EventBits_t bits = xEventGroupGetBits(sys_event_group);
+
+        if (bits & SYS_WS_RESTART_BIT) {
+            xEventGroupClearBits(sys_event_group, SYS_WS_RESTART_BIT | SYS_WS_OK_BIT);
+            ESP_LOGI("WS_MGR", "Reiniciando WebSocket para usar o token renovado");
+            ws_client_stop();
+            was_connected = false;
+            is_connecting = false;
+            vTaskDelay(pdMS_TO_TICKS(250));
+            continue;
+        }
 
         // Precisa de internet + auth
         if (!(bits & SYS_NET_ONLINE_BIT) || !(bits & SYS_AUTH_OK_BIT)) {
@@ -1061,9 +1266,80 @@ static bool existe_emergencia_ativa_global(void) {
     return entrada_emergencia_acionada(g_emergencia[0]);
 }
 
+bool bomba_seguranca_pronta(void) {
+    bool ready;
+    portENTER_CRITICAL(&g_bomba_state_mux);
+    ready = g_bomba_safety_ready;
+    portEXIT_CRITICAL(&g_bomba_state_mux);
+    return ready;
+}
+
+bool bomba_solicitar_comando(int idx, bool desejado, const char *origem) {
+    if (idx < 0 || idx >= g_cfg.qtd_bombas || idx >= MAX_BOMBAS)
+        return false;
+
+    bool aceito = false;
+    portENTER_CRITICAL(&g_bomba_state_mux);
+
+    bool remoto = entrada_remoto_ativo(g_local_remoto[idx]);
+    bool emergencia = g_bomba_emergency_lockout || entrada_emergencia_acionada(g_emergencia[idx]);
+
+    if (g_bomba_safety_ready && remoto && !emergencia) {
+        g_status_bomba_desejado[idx] = desejado;
+        g_controle_bomba_habilitado[idx] = true;
+        aceito = true;
+    }
+
+    portEXIT_CRITICAL(&g_bomba_state_mux);
+
+    if (!aceito) {
+        ESP_LOGW(TAG_BOMBA, "Comando %s rejeitado idx=%d origem=%s", desejado ? "LIGAR" : "DESLIGAR", idx,
+                 origem ? origem : "desconhecida");
+    }
+
+    return aceito;
+}
+
+static void bomba_atualizar_entradas_seguranca(const int *lr_bombas, const int *st_bombas, int emg_tanque, int n) {
+    bool emergencia_ativa = entrada_emergencia_acionada(emg_tanque);
+
+    portENTER_CRITICAL(&g_bomba_state_mux);
+
+    bool estava_pronta = g_bomba_safety_ready;
+    bool emergencia_anterior = g_bomba_emergency_lockout;
+
+    for (int i = 0; i < MAX_BOMBAS; i++) {
+        if (i < n) {
+            g_local_remoto[i] = lr_bombas[i];
+            g_emergencia[i] = emg_tanque;
+            if (st_bombas[i] >= 0)
+                g_status_bomba[i] = (st_bombas[i] == 1);
+        } else {
+            g_local_remoto[i] = 0;
+            g_emergencia[i] = emg_tanque;
+            g_status_bomba[i] = false;
+            g_status_bomba_desejado[i] = false;
+            g_controle_bomba_habilitado[i] = false;
+        }
+    }
+
+    if (emergencia_ativa || (estava_pronta && emergencia_anterior && !emergencia_ativa)) {
+        for (int i = 0; i < n; i++) {
+            g_status_bomba_desejado[i] = false;
+            g_controle_bomba_habilitado[i] = false;
+        }
+    }
+
+    g_bomba_emergency_lockout = emergencia_ativa;
+    g_bomba_safety_ready = true;
+
+    portEXIT_CRITICAL(&g_bomba_state_mux);
+}
+
 // Task para ler as portas do MCP23017
 void ler_portas_task(void *pvParameters) {
     static const char *TAG = "LER_PORTAS";
+    task_wdt_register_current("ler_portas");
 
     // Últimos estados lidos (persistem na task)
     static int last_modo_global = -1;       // 0=LOCAL (alguma bomba em local), 1=REMOTO (todas remoto)
@@ -1098,6 +1374,7 @@ void ler_portas_task(void *pvParameters) {
     ESP_LOGI(TAG, "Task de leitura de portas iniciada");
 
     while (1) {
+        task_wdt_kick();
         // ----------- LÊ MCP (tudo dentro do semáforo I2C) -----------
         int lr_bombas[MAX_BOMBAS] = {-1, -1, -1};
         int st_bombas[MAX_BOMBAS] = {-1, -1, -1};
@@ -1110,13 +1387,15 @@ void ler_portas_task(void *pvParameters) {
             n = MAX_BOMBAS;
 
         if (xSemaphoreTake(i2c_semaphore, pdMS_TO_TICKS(500)) == pdTRUE) {
-            // lê LR/EM + STATUS por bomba (somente se tiver bomba)
-            for (int i = 0; i < n; i++) {
-                lr_bombas[i] = ReadPinMcp(mcp_handle, bomba_lr_ref[i].port, bomba_lr_ref[i].pin);
-                st_bombas[i] = ReadPinMcp(mcp_handle, GPB, bomba_status_pin[i]);
+            int16_t gpb_snapshot = ReadRegisterMcp(mcp_handle, GPB);
+
+            if (gpb_snapshot >= 0) {
+                for (int i = 0; i < n; i++) {
+                    lr_bombas[i] = (gpb_snapshot & (1 << bomba_lr_ref[i].pin)) ? 1 : 0;
+                    st_bombas[i] = (gpb_snapshot & (1 << bomba_status_pin[i])) ? 1 : 0;
+                }
+                emg_tanque = (gpb_snapshot & (1 << Emergencia_GPB)) ? 1 : 0;
             }
-            // lê uma única emergência do tanque
-            emg_tanque = ReadPinMcp(mcp_handle, GPB, Emergencia_GPB);
 
             xSemaphoreGive(i2c_semaphore);
         } else {
@@ -1145,6 +1424,7 @@ void ler_portas_task(void *pvParameters) {
         }
 
         // ----------- ATUALIZA ESTADO GLOBAL -----------
+        portENTER_CRITICAL(&g_bomba_state_mux);
         for (int i = 0; i < MAX_BOMBAS; i++) {
             if (i < n) {
                 g_local_remoto[i] = lr_bombas[i];
@@ -1162,6 +1442,9 @@ void ler_portas_task(void *pvParameters) {
             }
         }
         // ----------- EVENTO: MODO INDIVIDUAL POR BOMBA -----------
+        portEXIT_CRITICAL(&g_bomba_state_mux);
+        bomba_atualizar_entradas_seguranca(lr_bombas, st_bombas, emg_tanque, n);
+
         for (int i = 0; i < n; i++) {
             int modo_bomba = entrada_remoto_ativo(lr_bombas[i]) ? 1 : 0; // 1=remoto, 0=manual/local
 
@@ -1495,7 +1778,7 @@ void ler_portas_task(void *pvParameters) {
             if ((bits & SYS_NET_ONLINE_BIT) && (bits & SYS_AUTH_OK_BIT)) {
                 if (xSemaphoreTake(MutexHTTP, pdMS_TO_TICKS(3000)) == pdTRUE) {
                     char msg[160];
-                    snprintf(msg, sizeof(msg), "Botão de emergência acionado no tanque %s", g_cfg.nome_tanque);
+                    snprintf(msg, sizeof(msg), "Botão de emergência acionado no tanque %s", NOME_CURTO);
 
                     esp_err_t err = api_post_tanque(msg, g_cfg.unidade_id);
 
@@ -1537,8 +1820,7 @@ void ler_portas_task(void *pvParameters) {
             if (net_ok && auth_ok) {
                 if (xSemaphoreTake(MutexHTTP, pdMS_TO_TICKS(3000)) == pdTRUE) {
                     char msg[160];
-                    snprintf(msg, sizeof(msg), "ALERTA: bomba %d do tanque %s está em MANUAL", i + 1,
-                             g_cfg.nome_tanque);
+                    snprintf(msg, sizeof(msg), "ALERTA: bomba %d do tanque %s está em MANUAL", i + 1, NOME_CURTO);
 
                     esp_err_t err = api_post_tanque(msg, g_cfg.unidade_id);
 
@@ -1674,26 +1956,40 @@ static int pct_from_4_20ma(float ma) {
     return (int)(pct + 0.5f); // arredonda
 }
 
+static bool ler_ads_tensao_media_locked(ads1115_mux_t mux, float *out_v) {
+    if (!out_v)
+        return false;
+
+    ads1115_set_mode(&_4a20ma, ADS1115_MODE_SINGLE);
+    ads1115_set_mux(&_4a20ma, mux);
+
+    (void)ads1115_get_voltage(&_4a20ma);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    float acc = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        float amostra = ads1115_get_voltage(&_4a20ma);
+        if (!isfinite(amostra) || amostra < 0.0f)
+            return false;
+
+        acc += amostra;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    *out_v = acc / 3.0f;
+    return true;
+}
+
 static bool ler_nivel_atual_pct(int *out_pct) {
     if (!out_pct)
         return false;
 
     float v = -1.0f;
     if (xSemaphoreTake(i2c_semaphore, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        ads1115_set_mode(&_4a20ma, ADS1115_MODE_SINGLE);
-        ads1115_set_mux(&_4a20ma, lerNivel);
-
-        (void)ads1115_get_voltage(&_4a20ma);
-        vTaskDelay(pdMS_TO_TICKS(20));
-
-        float acc = 0.0f;
-        for (int i = 0; i < 3; i++) {
-            acc += ads1115_get_voltage(&_4a20ma);
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
-        v = acc / 3.0f;
-
+        bool leitura_ok = ler_ads_tensao_media_locked(lerNivel, &v);
         xSemaphoreGive(i2c_semaphore);
+        if (!leitura_ok)
+            return false;
     }
 
     if (v < 0.0f)
@@ -1709,9 +2005,19 @@ static bool api_fetch_tanque_limits(int *out_min, int *out_max) {
     if (!out_min || !out_max || g_cfg.tanque_id <= 0)
         return false;
 
-    cJSON *root = NULL;
-    if (api_get_tanque_leitura(g_cfg.tanque_id, &root) != ESP_OK || !root)
+    if (!MutexHTTP || xSemaphoreTake(MutexHTTP, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGW("NIVEL", "Consulta de limites adiada: MutexHTTP ocupado");
         return false;
+    }
+
+    cJSON *root = NULL;
+    esp_err_t err = api_get_tanque_leitura(g_cfg.tanque_id, &root);
+    xSemaphoreGive(MutexHTTP);
+
+    if (err != ESP_OK || !root) {
+        cJSON_Delete(root);
+        return false;
+    }
 
     bool ok = false;
 
@@ -1719,9 +2025,17 @@ static bool api_fetch_tanque_limits(int *out_min, int *out_max) {
     cJSON *nmax = cJSON_GetObjectItem(root, "nivel_maximo");
 
     if (cJSON_IsNumber(nmin) && cJSON_IsNumber(nmax)) {
-        *out_min = nmin->valueint;
-        *out_max = nmax->valueint;
-        ok = true;
+        int nivel_minimo = nmin->valueint;
+        int nivel_maximo = nmax->valueint;
+
+        if (nivel_minimo >= 0 && nivel_minimo <= 100 && nivel_maximo >= 0 && nivel_maximo <= 100 &&
+            nivel_minimo < nivel_maximo) {
+            *out_min = nivel_minimo;
+            *out_max = nivel_maximo;
+            ok = true;
+        } else {
+            ESP_LOGW("NIVEL", "API retornou limites invalidos: min=%d max=%d", nivel_minimo, nivel_maximo);
+        }
     }
 
     cJSON_Delete(root);
@@ -1757,6 +2071,10 @@ static void api_get_tanque_limits_cached(int *out_min, int *out_max) {
         g_limits.max_pct = mx;
         g_limits.valid = true;
         g_limits.last_ms = now;
+
+        esp_err_t save_err = cfg_save_level_limits(mn, mx);
+        if (save_err != ESP_OK)
+            ESP_LOGW("NIVEL", "Falha ao salvar limites na NVS: %s", esp_err_to_name(save_err));
     }
 
     *out_min = g_limits.min_pct;
@@ -1781,28 +2099,28 @@ void nivel_task(void *pv) {
     bool alert_min_sent_n2 = false;
     bool alert_max_sent_n2 = false;
 
+    int lim_min_cache = (g_cfg.nivel_minimo >= 0 && g_cfg.nivel_minimo < 100) ? g_cfg.nivel_minimo : 0;
+    int lim_max_cache =
+        (g_cfg.nivel_maximo > lim_min_cache && g_cfg.nivel_maximo <= 100) ? g_cfg.nivel_maximo : 100;
+    g_limits.min_pct = lim_min_cache;
+    g_limits.max_pct = lim_max_cache;
+
+    ESP_LOGI(TAG, "Limites iniciais carregados da NVS: min=%d max=%d", lim_min_cache, lim_max_cache);
+
     while (1) {
         esp_task_wdt_reset();
         float v = -1.0f;
 
         if (xSemaphoreTake(i2c_semaphore, pdMS_TO_TICKS(800)) == pdTRUE) {
             // força SEMPRE o canal correto antes de ler
-            ads1115_set_mode(&_4a20ma, ADS1115_MODE_SINGLE);
-            ads1115_set_mux(&_4a20ma, lerNivel);
+            bool leitura_ok = ler_ads_tensao_media_locked(lerNivel, &v);
 
             // descarta 1 leitura “suja”
-            (void)ads1115_get_voltage(&_4a20ma);
-            vTaskDelay(pdMS_TO_TICKS(20));
 
             // média de 3 leituras
-            float acc = 0.0f;
-            for (int i = 0; i < 3; i++) {
-                acc += ads1115_get_voltage(&_4a20ma);
-                vTaskDelay(pdMS_TO_TICKS(20));
-            }
-            v = acc / 3.0f;
-
             xSemaphoreGive(i2c_semaphore);
+            if (!leitura_ok)
+                v = -1.0f;
         } else {
             ESP_LOGW(TAG, "Timeout semáforo I2C (ADS)");
         }
@@ -1824,9 +2142,6 @@ void nivel_task(void *pv) {
         bool pode_http = net_ok && auth_ok;
 
         // Guarda últimos limites conhecidos
-        static int lim_min_cache = 0;
-        static int lim_max_cache = 99;
-
         if (pode_http) {
             int lim_min_tmp = lim_min_cache;
             int lim_max_tmp = lim_max_cache;
@@ -1961,20 +2276,10 @@ void nivel_task(void *pv) {
             float v2 = -1.0f;
 
             if (xSemaphoreTake(i2c_semaphore, pdMS_TO_TICKS(800)) == pdTRUE) {
-                ads1115_set_mode(&_4a20ma, ADS1115_MODE_SINGLE);
-                ads1115_set_mux(&_4a20ma, lerNivel2);
-
-                (void)ads1115_get_voltage(&_4a20ma);
-                vTaskDelay(pdMS_TO_TICKS(20));
-
-                float acc2 = 0.0f;
-                for (int i = 0; i < 3; i++) {
-                    acc2 += ads1115_get_voltage(&_4a20ma);
-                    vTaskDelay(pdMS_TO_TICKS(20));
-                }
-                v2 = acc2 / 3.0f;
-
+                bool leitura_ok = ler_ads_tensao_media_locked(lerNivel2, &v2);
                 xSemaphoreGive(i2c_semaphore);
+                if (!leitura_ok)
+                    v2 = -1.0f;
             }
 
             if (v2 >= 0.0f) {
@@ -2098,9 +2403,9 @@ static esp_err_t mcp_escrever_bomba_idx(int idx, bool ligar) {
     if (xSemaphoreTake(i2c_semaphore, pdMS_TO_TICKS(500)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
 
-    esp_err_t err = WritePinMcp(mcp_handle, GPA, bomba_out_pin[idx], ligar ? 1 : 0);
+    uint8_t write_result = WritePinMcp(mcp_handle, GPA, bomba_out_pin[idx], ligar ? 1 : 0);
     xSemaphoreGive(i2c_semaphore);
-    return err;
+    return (write_result == 0) ? ESP_OK : ESP_FAIL;
 }
 
 //========================================================================================================
@@ -2109,13 +2414,18 @@ static esp_err_t mcp_escrever_bomba_idx(int idx, bool ligar) {
 void bombas_task(void *pv) {
     bool ultimo_desejado[MAX_BOMBAS] = {0};
     bool aguardando[MAX_BOMBAS] = {0};
+    bool saida_aplicada[MAX_BOMBAS] = {0};
+    bool saida_aplicada_valida[MAX_BOMBAS] = {0};
+    bool status_nvs[MAX_BOMBAS] = {0};
     int64_t t0_ms[MAX_BOMBAS] = {0};
+    task_wdt_register_current("bombas");
 
     for (int i = 0; i < g_cfg.qtd_bombas; i++) {
         bool restaurar = load_status_bomba(i);
 
         g_status_bomba_desejado[i] = restaurar;
         ultimo_desejado[i] = !restaurar; // força aplicar no primeiro loop
+        status_nvs[i] = restaurar;
 
         printf("Bomba %d restaurada: %d\n", i + 1, restaurar ? 1 : 0);
     }
@@ -2123,26 +2433,66 @@ void bombas_task(void *pv) {
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     while (1) {
+        task_wdt_kick();
+
+        if (!bomba_seguranca_pronta()) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
         for (int i = 0; i < g_cfg.qtd_bombas; i++) {
             int modo_bomba = entrada_remoto_ativo(g_local_remoto[i]) ? 1 : 0;
 
-            g_controle_bomba_habilitado[i] = (modo_bomba == 1);
+            portENTER_CRITICAL(&g_bomba_state_mux);
+            bool seguranca_pronta = g_bomba_safety_ready;
+            bool emergencia_ativa = g_bomba_emergency_lockout;
+            g_controle_bomba_habilitado[i] = seguranca_pronta && (modo_bomba == 1) && !emergencia_ativa;
 
-            if (modo_bomba == 0) {
+            if (!g_controle_bomba_habilitado[i]) {
                 g_status_bomba_desejado[i] = false;
             }
+            portEXIT_CRITICAL(&g_bomba_state_mux);
 
             // Segurança: só age se controle habilitado (por bomba)
             if (!g_controle_bomba_habilitado[i]) {
-                mcp_escrever_bomba_idx(i, false);
+                bool saida_ok = true;
+
+                if (!saida_aplicada_valida[i] || saida_aplicada[i]) {
+                    esp_err_t err = mcp_escrever_bomba_idx(i, false);
+                    saida_ok = (err == ESP_OK);
+
+                    if (saida_ok) {
+                        saida_aplicada[i] = false;
+                        saida_aplicada_valida[i] = true;
+                    } else {
+                        ESP_LOGW(TAG_BOMBA, "[B%d id=%d] Falha ao aplicar DESLIGAR: %s", i + 1,
+                                 g_cfg.bomba_id[i], esp_err_to_name(err));
+                    }
+                }
+
                 aguardando[i] = false;
                 ultimo_desejado[i] = false;
-                save_status_bomba(i, false);
+
+                if (saida_ok && status_nvs[i]) {
+                    save_status_bomba(i, false);
+                    status_nvs[i] = false;
+                }
                 continue;
             }
 
             if (!entrada_remoto_ativo(g_local_remoto[i]) || existe_emergencia_ativa_global()) {
-                mcp_escrever_bomba_idx(i, false);
+                if (!saida_aplicada_valida[i] || saida_aplicada[i]) {
+                    esp_err_t err = mcp_escrever_bomba_idx(i, false);
+
+                    if (err == ESP_OK) {
+                        saida_aplicada[i] = false;
+                        saida_aplicada_valida[i] = true;
+                    } else {
+                        ESP_LOGW(TAG_BOMBA, "[B%d id=%d] Falha no desligamento de seguranca: %s", i + 1,
+                                 g_cfg.bomba_id[i], esp_err_to_name(err));
+                    }
+                }
+
                 aguardando[i] = false;
                 ultimo_desejado[i] = false;
                 continue;
@@ -2152,7 +2502,7 @@ void bombas_task(void *pv) {
 
             // Mudou desejado?
 
-            if (desejado != ultimo_desejado[i]) {
+            if (desejado != ultimo_desejado[i] || !saida_aplicada_valida[i] || saida_aplicada[i] != desejado) {
 
                 printf("  status_desejado: %s\n", g_status_bomba_desejado[i] ? "LIGADA" : "DESLIGADA");
 
@@ -2160,18 +2510,27 @@ void bombas_task(void *pv) {
 
                 printf("Ultimo  status_desejado: %s\n", ultimo_desejado[i] ? "LIGADA" : "DESLIGADA");
 
-                ultimo_desejado[i] = desejado;
-
                 ESP_LOGW(TAG_BOMBA, "[B%d id=%d] Desejado -> %s", i + 1, g_cfg.bomba_id[i],
                          desejado ? "LIGAR" : "DESLIGAR");
 
-                if (mcp_escrever_bomba_idx(i, desejado) == ESP_OK) {
+                esp_err_t err = mcp_escrever_bomba_idx(i, desejado);
+                if (err == ESP_OK) {
+                    ultimo_desejado[i] = desejado;
+                    saida_aplicada[i] = desejado;
+                    saida_aplicada_valida[i] = true;
+
                     vTaskDelay(pdMS_TO_TICKS(500));
 
                     aguardando[i] = true;
                     t0_ms[i] = esp_timer_get_time() / 1000;
 
-                    save_status_bomba(i, desejado);
+                    if (status_nvs[i] != desejado) {
+                        save_status_bomba(i, desejado);
+                        status_nvs[i] = desejado;
+                    }
+                } else {
+                    ESP_LOGW(TAG_BOMBA, "[B%d id=%d] Falha ao aplicar comando; nova tentativa no proximo ciclo: %s",
+                             i + 1, g_cfg.bomba_id[i], esp_err_to_name(err));
                 }
             }
 
@@ -2273,6 +2632,7 @@ static bool ler_corrente_bomba_idx(int idx, float *out_corrente_a) {
 
 void corrente_task(void *pv) {
     static const char *TAGC = "CORRENTE";
+    task_wdt_register_current("corrente");
 
     float last_corrente[MAX_BOMBAS] = {-1000.0f, -1000.0f, -1000.0f};
 
@@ -2282,6 +2642,7 @@ void corrente_task(void *pv) {
     int64_t last_send_ms[MAX_BOMBAS] = {0, 0, 0};
 
     while (1) {
+        task_wdt_kick();
         EventBits_t bits = xEventGroupGetBits(sys_event_group);
         bool net_ok = (bits & SYS_NET_ONLINE_BIT) != 0;
         bool auth_ok = (bits & SYS_AUTH_OK_BIT) != 0;
@@ -2290,6 +2651,7 @@ void corrente_task(void *pv) {
         int64_t now_ms = esp_timer_get_time() / 1000;
 
         for (int i = 0; i < g_cfg.qtd_bombas && i < MAX_BOMBAS; i++) {
+            task_wdt_kick();
             if (g_cfg.bomba_id[i] <= 0)
                 continue;
 
@@ -2413,7 +2775,6 @@ void ConnectRest() {
     gpio_reset_pin(I2C_SDA);
     gpio_reset_pin(I2C_SCL);
 
-    vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart(); // Reinicia o ESP
 }
 
@@ -2421,22 +2782,20 @@ void ConnectRest() {
 
 // Callback do timer: se chegar aqui, é porque o timer expirou (timeout), ou seja, nenhuma atividade detectada
 void watchdog_callback(void *arg) {
+    (void)arg;
     g_last_restart_marker = 1;
     ESP_EARLY_LOGE("SOFT_WDT", "Watchdog de software expirou -> reiniciando");
-    ConnectRest();
+    esp_restart();
 }
 
 // Função para iniciar o timer watchdog (10 segundos)
 void start_watchdog_timer() {
-    const esp_timer_create_args_t timer_args = {.callback = &watchdog_callback, .name = "watchdog_timer"};
-    esp_timer_create(&timer_args, &watchdog_timer);
-    esp_timer_start_once(watchdog_timer, 10000000); // 10 segundos
+    task_wdt_register_current("app_main");
 }
 
 // Função para resetar o timer watchdog (chame sempre que detectar atividade)
 void reset_watchdog_timer() {
-    esp_timer_stop(watchdog_timer);
-    esp_timer_start_once(watchdog_timer, 10000000); // Reinicia para 10s
+    task_wdt_kick();
 }
 
 /*############################################## Lora  ################################################*/
@@ -2454,13 +2813,52 @@ static void lora_setup_tanque(void) {
         .head = 0xC0,
         .addh = 0x00,
         .addl = 0x01,
-        .speed = 0x18, // 9600 UART + menor air rate para alcance longo
+        .speed = 0x18, // configuracao legada usada pelos tanques instalados em campo
         .channel = 0x17,
         .option = 0x64,
     };
 
-    ESP_ERROR_CHECK(lora_e32_init(&cfg));
-    ESP_ERROR_CHECK(lora_e32_apply_cfg());
+    g_lora_setup_ok = false;
+
+    esp_err_t err = lora_e32_init(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE("LORA", "Falha ao inicializar E32: %s", esp_err_to_name(err));
+        return;
+    }
+
+    for (int tentativa = 1; tentativa <= 5; tentativa++) {
+        err = lora_e32_apply_cfg();
+        if (err == ESP_OK) {
+            g_lora_setup_ok = true;
+            return;
+        }
+
+        ESP_LOGE("LORA", "Falha ao configurar/validar E32 tentativa %d/5: %s", tentativa, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+static bool tanque_lora_recover_radio(void) {
+    if (!MutexLora || xSemaphoreTake(MutexLora, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE("LORA_HEALTH", "Nao foi possivel reservar o radio para recuperacao");
+        return false;
+    }
+
+    esp_err_t err = lora_e32_reinit();
+    if (err == ESP_OK) {
+        err = lora_e32_apply_cfg_temp();
+    }
+    xSemaphoreGive(MutexLora);
+
+    g_lora_setup_ok = (err == ESP_OK);
+    if (g_lora_setup_ok) {
+        g_lora_transaction_failures = 0;
+        ESP_LOGI("LORA_HEALTH", "E32 reinicializado e configuracao confirmada");
+    } else {
+        ESP_LOGE("LORA_HEALTH", "Falha ao recuperar E32: %s", esp_err_to_name(err));
+    }
+
+    return g_lora_setup_ok;
 }
 
 typedef struct {
@@ -2641,10 +3039,16 @@ static void tanque_send_ack(const lora_app_frame_t *rx) {
     ack.has_bomba_id = 0;
     ack.bomba_id = 0;
     if (xSemaphoreTake(MutexLora, pdMS_TO_TICKS(LORA_ACK_SEND_TIMEOUT_MS)) == pdTRUE) {
-        lora_send_frame_air(&ack);
+        int expected = (int)lora_frame_air_len(&ack);
+        int sent = lora_send_frame_air(&ack);
         xSemaphoreGive(MutexLora);
-        ESP_LOGI("LORA", "ACK enviado -> dst=%u msg_id=%u", rx->src_id, rx->msg_id);
-        vTaskDelay(pdMS_TO_TICKS(LORA_POST_TX_GUARD_MS));
+
+        if (expected > 0 && sent == expected) {
+            ESP_LOGI("LORA", "ACK enviado -> dst=%u msg_id=%u", rx->src_id, rx->msg_id);
+            vTaskDelay(pdMS_TO_TICKS(LORA_POST_TX_GUARD_MS));
+        } else {
+            ESP_LOGE("LORA", "Falha ao enviar ACK msg_id=%u bytes=%d/%d", rx->msg_id, sent, expected);
+        }
     } else {
         ESP_LOGW("LORA", "Falha ao pegar MutexLora para ACK msg_id=%u", rx->msg_id);
     }
@@ -2654,6 +3058,10 @@ static void tanque_send_ack(const lora_app_frame_t *rx) {
 // ACK.
 bool tanque_send_to_gtw_ack(uint16_t src_tank_id, uint16_t gtw_id, const char *msg, uint8_t has_bomba,
                             uint16_t bomba_id) {
+    if (!g_lora_setup_ok && !tanque_lora_recover_radio()) {
+        return false;
+    }
+
     lora_app_frame_t frame = {0};
 
     frame.preamble = LORA_PREAMBLE;
@@ -2672,22 +3080,34 @@ bool tanque_send_to_gtw_ack(uint16_t src_tank_id, uint16_t gtw_id, const char *m
     }
 
     for (int attempt = 1; attempt <= LORA_MAX_RETRIES; attempt++) {
+        task_wdt_kick();
         ESP_LOGI("LORA", "TX DATA -> dst=%u msg_id=%u tentativa=%d", frame.dst_id, frame.msg_id, attempt);
 
 #if (LORA_REQUIRE_ACK != 0)
         lora_ack_wait_begin(frame.msg_id, DEV_GTW, frame.dst_id);
 #endif
 
+        bool frame_enviado = false;
         if (xSemaphoreTake(MutexLora, pdMS_TO_TICKS(2500)) == pdTRUE) {
-            lora_send_frame_air(&frame);
+            int expected = (int)lora_frame_air_len(&frame);
+            int sent = lora_send_frame_air(&frame);
             xSemaphoreGive(MutexLora);
 
-            vTaskDelay(pdMS_TO_TICKS(LORA_POST_TX_GUARD_MS));
-        } else {
+            frame_enviado = (expected > 0 && sent == expected);
+            if (frame_enviado) {
+                vTaskDelay(pdMS_TO_TICKS(LORA_POST_TX_GUARD_MS));
+            } else {
+                ESP_LOGE("LORA", "Falha UART LoRa id=%u tentativa=%d bytes=%d/%d", frame.msg_id, attempt, sent,
+                         expected);
+            }
+        }
+
+        if (!frame_enviado) {
 #if (LORA_REQUIRE_ACK != 0)
             lora_ack_wait_cancel();
 #endif
-            vTaskDelay(pdMS_TO_TICKS(50));
+            if (attempt < LORA_MAX_RETRIES)
+                vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
@@ -2695,24 +3115,37 @@ bool tanque_send_to_gtw_ack(uint16_t src_tank_id, uint16_t gtw_id, const char *m
         return true;
 #else
         if (lora_wait_ack_notification(LORA_ACK_TIMEOUT_MS)) {
+            g_lora_transaction_failures = 0;
             ESP_LOGI("LORA", "ACK recebido id=%u", frame.msg_id);
             return true;
         }
 
         lora_ack_wait_cancel();
         ESP_LOGW("LORA", "ACK timeout id=%u tentativa=%d", frame.msg_id, attempt);
-        uint32_t backoff_ms = (LORA_RETRY_BACKOFF_MIN_MS * attempt) + (esp_random() % LORA_RETRY_BACKOFF_JITTER_MS);
-        ESP_LOGW("LORA", "Nova tentativa LoRa em %u ms", (unsigned)backoff_ms);
-        vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+        if (attempt < LORA_MAX_RETRIES) {
+            uint32_t backoff_ms =
+                (LORA_RETRY_BACKOFF_MIN_MS * attempt) + (esp_random() % LORA_RETRY_BACKOFF_JITTER_MS);
+            ESP_LOGW("LORA", "Nova tentativa LoRa em %u ms", (unsigned)backoff_ms);
+            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+        }
 #endif
     }
 
     ESP_LOGE("LORA >>>", "Falha envio id=%d", frame.msg_id);
+    g_lora_transaction_failures++;
+    if (g_lora_transaction_failures >= LORA_FAILURES_BEFORE_RECOVERY) {
+        ESP_LOGW("LORA_HEALTH", "Falhas LoRa consecutivas; iniciando recuperacao validada do E32");
+        tanque_lora_recover_radio();
+    }
     return false;
 }
 
 bool tanque_send_to_gtw_noack(uint16_t src_tank_id, uint16_t gtw_id, const char *msg, uint8_t has_bomba,
                               uint16_t bomba_id) {
+    if (!g_lora_setup_ok && !tanque_lora_recover_radio()) {
+        return false;
+    }
+
     lora_app_frame_t frame = {0};
 
     frame.preamble = LORA_PREAMBLE;
@@ -2734,9 +3167,15 @@ bool tanque_send_to_gtw_noack(uint16_t src_tank_id, uint16_t gtw_id, const char 
         return false;
     }
 
-    lora_send_frame_air(&frame);
+    int expected = (int)lora_frame_air_len(&frame);
+    int sent = lora_send_frame_air(&frame);
     xSemaphoreGive(MutexLora);
+    if (expected <= 0 || sent != expected) {
+        ESP_LOGE("LORA", "Falha UART LoRa sem ACK bytes=%d/%d", sent, expected);
+        return false;
+    }
     vTaskDelay(pdMS_TO_TICKS(LORA_POST_TX_GUARD_MS));
+    g_lora_transaction_failures = 0;
     return true;
 }
 
@@ -2744,21 +3183,29 @@ bool tanque_send_to_gtw_noack(uint16_t src_tank_id, uint16_t gtw_id, const char 
 // metadados.
 void tanque_lora_tx_task(void *pv) {
     tx_item_t item;
+    task_wdt_register_current("lora_tx");
 
     ESP_LOGI("LORA", "TX TANQUE iniciado");
 
     while (1) {
-        if (xQueueReceive(lora_tx_queue, &item, portMAX_DELAY) == pdTRUE) {
+        task_wdt_kick();
+        if (xQueueReceive(lora_tx_queue, &item, pdMS_TO_TICKS(5000)) == pdTRUE) {
             uint16_t src_tank_id = item.src_tank_id;
             if (src_tank_id == 0) {
                 src_tank_id = tanque_lora_get_device_id();
             }
 
+            bool entregue = false;
+            task_wdt_kick();
 #if (LORA_REQUIRE_ACK != 0)
-            (void)tanque_send_to_gtw_ack(src_tank_id, item.gtw_id, item.msg, item.has_bomba, item.bomba_id);
+            entregue = tanque_send_to_gtw_ack(src_tank_id, item.gtw_id, item.msg, item.has_bomba, item.bomba_id);
 #else
-            (void)tanque_send_to_gtw_noack(src_tank_id, item.gtw_id, item.msg, item.has_bomba, item.bomba_id);
+            entregue = tanque_send_to_gtw_noack(src_tank_id, item.gtw_id, item.msg, item.has_bomba, item.bomba_id);
 #endif
+            if (!entregue) {
+                ESP_LOGE("LORA", "Item descartado apos %d tentativas; liberando o proximo da fila",
+                         LORA_MAX_RETRIES);
+            }
         }
     }
 }
@@ -2792,12 +3239,54 @@ static void tanque_process_cmd_from_gtw(const lora_app_frame_t *rx) {
     if (!vazao)
         vazao = cJSON_GetObjectItemCaseSensitive(root, "v");
     cJSON *controle = cJSON_GetObjectItemCaseSensitive(root, "c");
+    cJSON *executar = cJSON_GetObjectItemCaseSensitive(root, "q");
 
     bool tem_vazao = cJSON_IsNumber(vazao);
     bool cmd_bomba_ok = !cmd || (cJSON_IsString(cmd) && strcmp(cmd->valuestring, "bomba") == 0);
-    bool tem_cmd_bomba = cmd_bomba_ok && cJSON_IsNumber(status) && rx->has_bomba_id;
-
+    bool q_numero_valido = cJSON_IsNumber(executar) &&
+                           (executar->valuedouble == 0.0 || executar->valuedouble == 1.0);
+    bool comando_explicito = cJSON_IsBool(executar) || q_numero_valido;
+    bool executar_comando = cJSON_IsTrue(executar) || (cJSON_IsNumber(executar) && executar->valueint != 0);
     bool eh_bomba_pwm = rx->has_bomba_id && (rx->bomba_id == BOMBA_PWM_ID);
+
+    if (!rx->has_bomba_id || bomba_index_from_id(rx->bomba_id) < 0) {
+        ESP_LOGW("LORA", "Comando incompleto/estranho descartado: bomba ausente ou nao configurada (id=%u has=%u)",
+                 rx->bomba_id, rx->has_bomba_id);
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (executar && !comando_explicito) {
+        ESP_LOGW("LORA", "Comando descartado: campo q invalido para bomba_id=%u", rx->bomba_id);
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (!cmd_bomba_ok) {
+        ESP_LOGW("LORA", "Comando descartado: acao cmd desconhecida para bomba_id=%u", rx->bomba_id);
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (tem_vazao && (vazao->valuedouble < 0.0 || vazao->valuedouble > 100.0)) {
+        ESP_LOGW("LORA", "Comando descartado: vazao fora da faixa para bomba_id=%u", rx->bomba_id);
+        cJSON_Delete(root);
+        return;
+    }
+
+    bool tem_status_valido = cJSON_IsNumber(status) &&
+                             (status->valuedouble == 0.0 || status->valuedouble == 1.0);
+    bool tem_ajuste_vazao_valido = tem_vazao && eh_bomba_pwm;
+
+    if ((comando_explicito && executar_comando && !tem_status_valido) ||
+        (comando_explicito && !executar_comando && !tem_ajuste_vazao_valido) ||
+        (!comando_explicito && !tem_status_valido && !tem_ajuste_vazao_valido)) {
+        ESP_LOGW("LORA", "Comando incompleto descartado: acao/status/vazao ausente para bomba_id=%u", rx->bomba_id);
+        cJSON_Delete(root);
+        return;
+    }
+
+    bool tem_cmd_bomba = cmd_bomba_ok && tem_status_valido && (!comando_explicito || executar_comando);
 
     float valor_vazao = 0.0f;
     if (tem_vazao)
@@ -2805,11 +3294,10 @@ static void tanque_process_cmd_from_gtw(const lora_app_frame_t *rx) {
 
     bool vazao_mudou = false;
     if (tem_vazao && eh_bomba_pwm) {
-        vazao_mudou = (fabsf(valor_vazao - g_vazao_pwm_percent) > 0.01f);
+        vazao_mudou = (fabsf(valor_vazao - pwm_obter_setpoint_percent()) > 0.01f);
     }
 
     if (tem_vazao && eh_bomba_pwm) {
-        pwm_processar_novo_setpoint(valor_vazao);
         pwm_agendar_sync_vazao(rx->bomba_id, valor_vazao);
 
         ESP_LOGI("LORA", "Setpoint PWM recebido via LoRa -> bomba_id=%u valor=%.2f%%", rx->bomba_id,
@@ -2820,11 +3308,11 @@ static void tanque_process_cmd_from_gtw(const lora_app_frame_t *rx) {
 
     bool processa_cmd = tem_cmd_bomba;
 
-    if (processa_cmd && eh_bomba_pwm && tem_vazao) {
+    if (!comando_explicito && processa_cmd && eh_bomba_pwm && tem_vazao) {
         int st = status->valueint;
         if (st == 1 && vazao_mudou) {
             processa_cmd = false;
-            ESP_LOGI("LORA", "Pacote interpretado como AJUSTE DE VAZAO -> comando nao processado");
+            ESP_LOGI("LORA", "Pacote legado interpretado como AJUSTE DE VAZAO -> comando nao processado");
         }
     }
 
@@ -2837,7 +3325,6 @@ static void tanque_process_cmd_from_gtw(const lora_app_frame_t *rx) {
         ESP_LOGW("LORA", "JSON sem cmd/status validos e sem vazao valida");
     }
 
-    pwm_atualizar_saida_por_estado();
     cJSON_Delete(root);
 }
 
@@ -2878,37 +3365,33 @@ bool tratar_comando_bomba(const char *cmd, int valor, uint16_t bomba_id, int con
     }
     g_bomba_controle_id[idx] = controle_id;
 
-    if (existe_emergencia_ativa_global()) {
-        ESP_LOGW("LORA >>>", "Comando ignorado para bomba_id=%d: emergencia global ativa", bomba_id);
+    bool desejado = (valor_invertido != 0);
+    if (!bomba_solicitar_comando(idx, desejado, "LoRa")) {
+        ESP_LOGW("LORA >>>", "Comando ignorado para bomba_id=%d: seguranca, emergencia ou modo local", bomba_id);
 
-        if (valor_invertido) {
-            enviar_alerta_bomba_api_online(idx, "FALHA AO LIGAR BOMBA", "emergencia global ativa");
-        }
+        if (desejado)
+            enviar_alerta_bomba_api_online(idx, "FALHA AO LIGAR BOMBA", "comando bloqueado pela seguranca");
 
-        g_controle_bomba_habilitado[idx] = false;
-        g_status_bomba_desejado[idx] = false;
         return false;
     }
-
-    g_controle_bomba_habilitado[idx] = true;
-    g_status_bomba_desejado[idx] = (valor_invertido ? true : false);
 
     if (g_status_bomba[idx] == g_status_bomba_desejado[idx]) {
         lora_enqueue_json_bomba_int((uint16_t)bomba_id, "status", g_status_bomba[idx]);
     }
 
     ESP_LOGI("LORA >>>", "Bomba idx=%d setada para %d", idx, valor_invertido);
-    pwm_atualizar_saida_por_estado();
     return true;
 }
 
 static void tanque_lora_app_task(void *pv) {
     lora_rx_app_item_t item;
+    task_wdt_register_current("lora_app");
 
     ESP_LOGI("LORA", "APP TANQUE iniciado");
 
     while (1) {
-        if (xQueueReceive(lora_rx_app_queue, &item, portMAX_DELAY) == pdTRUE) {
+        task_wdt_kick();
+        if (xQueueReceive(lora_rx_app_queue, &item, pdMS_TO_TICKS(5000)) == pdTRUE) {
             lora_app_frame_t *rx = &item.frame;
 
             switch (rx->msg_type) {
@@ -2946,10 +3429,12 @@ void tanque_lora_rx_task(void *pv) {
     uint16_t my_id = tanque_lora_get_device_id();
     tanque_lora_rx_stats_t stats = {0};
     int64_t last_stats_log_ms = esp_timer_get_time() / 1000;
+    task_wdt_register_current("lora_rx");
 
     ESP_LOGI("LORA", "RX TANQUE iniciado (ID=%u)", my_id);
 
     while (1) {
+        task_wdt_kick();
         memset(&rx, 0, sizeof(rx));
         my_id = tanque_lora_get_device_id();
         int r = 0;
@@ -2960,7 +3445,7 @@ void tanque_lora_rx_task(void *pv) {
             last_stats_log_ms = now_ms;
         }
 
-        if (xSemaphoreTake(MutexLora, portMAX_DELAY) == pdTRUE) {
+        if (xSemaphoreTake(MutexLora, pdMS_TO_TICKS(5000)) == pdTRUE) {
             r = lora_e32_receive_raw((uint8_t *)&rx, sizeof(rx), LORA_RX_READ_TIMEOUT_MS);
             xSemaphoreGive(MutexLora);
         } else {
@@ -2969,6 +3454,10 @@ void tanque_lora_rx_task(void *pv) {
         }
 
         if (r <= 0) {
+            if (r < 0) {
+                g_lora_setup_ok = false;
+                ESP_LOGE("LORA_HEALTH", "Falha UART ao receber; E32 marcado para recuperacao");
+            }
             stats.timeout++;
             if ((stats.timeout % 500U) == 0U) {
                 tanque_lora_log_rx_stats(&stats, "timeout_500");
@@ -3077,9 +3566,10 @@ void tanque_lora_rx_task(void *pv) {
 }
 
 void tanque_lora_start(void) {
-    static bool started = false;
-    if (started)
+    if (g_lora_started)
         return;
+
+    msg_counter = (uint8_t)esp_random();
 
     if (!g_lora_ack_mutex) {
         g_lora_ack_mutex = xSemaphoreCreateMutex();
@@ -3110,16 +3600,40 @@ void tanque_lora_start(void) {
 
     ESP_LOGW("LORA", "Iniciando rádio E32.");
     lora_setup_tanque();
+    if (!g_lora_setup_ok) {
+        ESP_LOGE("LORA", "E32 indisponivel; inicio sera tentado novamente");
+        return;
+    }
     ESP_LOGW("LORA", "Rádio OK, iniciando tasks TX/RX/APP.");
 
-    xTaskCreate(tanque_lora_tx_task, "lora_tx", 4096, NULL, 5, NULL);
-    xTaskCreate(tanque_lora_rx_task, "lora_rx", 8192, NULL, 5, NULL);
-    xTaskCreate(tanque_lora_app_task, "lora_app", 6144, NULL, 5, &g_lora_app_task_handle);
+    TaskHandle_t tx_task = NULL;
+    TaskHandle_t rx_task = NULL;
+    TaskHandle_t app_task = NULL;
 
-    started = true;
+    BaseType_t tx_ok = xTaskCreate(tanque_lora_tx_task, "lora_tx", 4096, NULL, 5, &tx_task);
+    BaseType_t rx_ok = xTaskCreate(tanque_lora_rx_task, "lora_rx", 8192, NULL, 5, &rx_task);
+    BaseType_t app_ok = xTaskCreate(tanque_lora_app_task, "lora_app", 6144, NULL, 5, &app_task);
+
+    if (tx_ok != pdPASS || rx_ok != pdPASS || app_ok != pdPASS) {
+        ESP_LOGE("LORA", "Falha ao criar tasks LoRa; reiniciando para recuperar memoria");
+        esp_restart();
+    }
+
+    g_lora_app_task_handle = app_task;
+    g_lora_started = true;
 }
 
-static void lora_start_if_needed(void) { tanque_lora_start(); }
+static void lora_start_if_needed(void) {
+    if (g_lora_started)
+        return;
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if ((now_ms - g_lora_last_start_try_ms) < 30000)
+        return;
+
+    g_lora_last_start_try_ms = now_ms;
+    tanque_lora_start();
+}
 
 static void lora_boot_snapshot_task(void *pv) {
     (void)pv;
@@ -3380,24 +3894,38 @@ static bool lora_enqueue_alerta_codigo_controle(uint8_t codigo, int unidade_id, 
         return false;
 
     tx_item_t item = {.gtw_id = LORA_GTW_ID, .has_bomba = 2, .bomba_id = 0};
+    char tanque_nome[sizeof(g_cfg.nome_tanque)];
+    const char *nome_configurado = NOME_CURTO;
+    size_t nome_len = strnlen(nome_configurado, sizeof(tanque_nome) - 1);
+
+    memcpy(tanque_nome, nome_configurado, nome_len);
+    tanque_nome[nome_len] = '\0';
+    for (size_t i = 0; i < nome_len; i++) {
+        unsigned char c = (unsigned char)tanque_nome[i];
+        if (c < 0x20 || c == '"' || c == '\\')
+            tanque_nome[i] = '_';
+    }
+
     int n;
 
     if (pct >= 0 && bomba_id > 0 && controle_id > 0) {
-        n = snprintf(item.msg, sizeof(item.msg), "{\"a\":%u,\"u\":%d,\"b\":%d,\"c\":%d,\"p\":%d}", (unsigned)codigo,
-                     unidade_id, bomba_id, controle_id, pct);
+        n = snprintf(item.msg, sizeof(item.msg), "{\"a\":%u,\"u\":%d,\"b\":%d,\"c\":%d,\"p\":%d,\"t\":\"%s\"}",
+                     (unsigned)codigo, unidade_id, bomba_id, controle_id, pct, tanque_nome);
     } else if (pct >= 0 && bomba_id > 0) {
-        n = snprintf(item.msg, sizeof(item.msg), "{\"a\":%u,\"u\":%d,\"b\":%d,\"p\":%d}", (unsigned)codigo, unidade_id,
-                     bomba_id, pct);
+        n = snprintf(item.msg, sizeof(item.msg), "{\"a\":%u,\"u\":%d,\"b\":%d,\"p\":%d,\"t\":\"%s\"}",
+                     (unsigned)codigo, unidade_id, bomba_id, pct, tanque_nome);
     } else if (bomba_id > 0 && controle_id > 0) {
-        n = snprintf(item.msg, sizeof(item.msg), "{\"a\":%u,\"u\":%d,\"b\":%d,\"c\":%d}", (unsigned)codigo, unidade_id,
-                     bomba_id, controle_id);
+        n = snprintf(item.msg, sizeof(item.msg), "{\"a\":%u,\"u\":%d,\"b\":%d,\"c\":%d,\"t\":\"%s\"}",
+                     (unsigned)codigo, unidade_id, bomba_id, controle_id, tanque_nome);
     } else if (pct >= 0) {
-        n = snprintf(item.msg, sizeof(item.msg), "{\"a\":%u,\"u\":%d,\"p\":%d}", (unsigned)codigo, unidade_id, pct);
+        n = snprintf(item.msg, sizeof(item.msg), "{\"a\":%u,\"u\":%d,\"p\":%d,\"t\":\"%s\"}", (unsigned)codigo,
+                     unidade_id, pct, tanque_nome);
     } else if (bomba_id > 0) {
-        n = snprintf(item.msg, sizeof(item.msg), "{\"a\":%u,\"u\":%d,\"b\":%d}", (unsigned)codigo, unidade_id,
-                     bomba_id);
+        n = snprintf(item.msg, sizeof(item.msg), "{\"a\":%u,\"u\":%d,\"b\":%d,\"t\":\"%s\"}", (unsigned)codigo,
+                     unidade_id, bomba_id, tanque_nome);
     } else {
-        n = snprintf(item.msg, sizeof(item.msg), "{\"a\":%u,\"u\":%d}", (unsigned)codigo, unidade_id);
+        n = snprintf(item.msg, sizeof(item.msg), "{\"a\":%u,\"u\":%d,\"t\":\"%s\"}", (unsigned)codigo, unidade_id,
+                     tanque_nome);
     }
 
     if (n <= 0 || n >= (int)sizeof(item.msg))
@@ -3433,78 +3961,152 @@ void vazao_sync_task(void *pv) {
     static const char *TAGV = "VAZAO_SYNC";
     static int last_sent_http = -1;
     static int last_sent_lora = -1;
+    task_wdt_register_current("vazao_sync");
+
+    if (!vazao_sync_queue) {
+        ESP_LOGE(TAGV, "Fila de sincronizacao nao foi criada");
+        (void)esp_task_wdt_delete(NULL);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int pct = 0;
 
     while (1) {
-        if (!g_vazao_pwm_sync_pendente) {
-            vTaskDelay(pdMS_TO_TICKS(300));
+        task_wdt_kick();
+        if (xQueueReceive(vazao_sync_queue, &pct, pdMS_TO_TICKS(5000)) != pdTRUE)
             continue;
-        }
 
-        int pct = g_vazao_pwm_sync_pct;
+        while (1) {
+            task_wdt_kick();
+            EventBits_t bits = xEventGroupGetBits(sys_event_group);
+            bool net_ok = (bits & SYS_NET_ONLINE_BIT) != 0;
+            bool auth_ok = (bits & SYS_AUTH_OK_BIT) != 0;
+            bool pode_http = net_ok && auth_ok;
+            bool concluido = false;
 
-        EventBits_t bits = xEventGroupGetBits(sys_event_group);
-        bool net_ok = (bits & SYS_NET_ONLINE_BIT) != 0;
-        bool auth_ok = (bits & SYS_AUTH_OK_BIT) != 0;
-        bool pode_http = net_ok && auth_ok;
-
-        if (!pode_http) {
-            if (pct != last_sent_lora) {
-                bool ok = lora_enqueue_json_bomba_int((uint16_t)BOMBA_PWM_ID, "vazao", pct);
-                if (ok) {
-                    last_sent_lora = pct;
-                    g_vazao_pwm_sync_pendente = false;
-
-                    ESP_LOGI(TAGV, "Vazao enviada via LoRa -> %d%%", pct);
+            if (!pode_http) {
+                if (pct == last_sent_lora) {
+                    concluido = true;
                 } else {
-                    ESP_LOGW(TAGV, "Falha ao enfileirar vazao via LoRa");
+                    bool ok = lora_enqueue_json_bomba_int((uint16_t)BOMBA_PWM_ID, "vazao", pct);
+                    if (ok) {
+                        last_sent_lora = pct;
+                        concluido = true;
+                        ESP_LOGI(TAGV, "Vazao enviada via LoRa -> %d%%", pct);
+                    } else {
+                        ESP_LOGW(TAGV, "Falha ao enfileirar vazao via LoRa");
+                    }
                 }
+            } else if (pct == last_sent_http) {
+                concluido = true;
             } else {
-                g_vazao_pwm_sync_pendente = false;
+                if (xSemaphoreTake(MutexHTTP, pdMS_TO_TICKS(3000)) == pdTRUE) {
+                    esp_err_t err = ESP_FAIL;
+                    cJSON *patch = cJSON_CreateObject();
+
+                    if (patch) {
+                        cJSON_AddNumberToObject(patch, "vazao", pct);
+                        err = api_patch_bomba(BOMBA_PWM_ID, patch);
+                        cJSON_Delete(patch);
+                    }
+
+                    xSemaphoreGive(MutexHTTP);
+
+                    if (err == ESP_OK) {
+                        last_sent_http = pct;
+                        concluido = true;
+                        ESP_LOGI(TAGV, "PATCH vazao OK -> %d%%", pct);
+                    } else {
+                        ESP_LOGW(TAGV, "Falha PATCH vazao (%s)", esp_err_to_name(err));
+                    }
+                }
             }
 
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
-        }
-
-        if (pct == last_sent_http) {
-            g_vazao_pwm_sync_pendente = false;
-            vTaskDelay(pdMS_TO_TICKS(300));
-            continue;
-        }
-
-        if (xSemaphoreTake(MutexHTTP, pdMS_TO_TICKS(3000)) == pdTRUE) {
-            esp_err_t err = ESP_FAIL;
-            cJSON *patch = cJSON_CreateObject();
-
-            if (patch) {
-                cJSON_AddNumberToObject(patch, "vazao", pct);
-                err = api_patch_bomba(BOMBA_PWM_ID, patch);
-                cJSON_Delete(patch);
+            int pct_mais_novo = 0;
+            if (concluido) {
+                if (xQueueReceive(vazao_sync_queue, &pct_mais_novo, 0) == pdTRUE) {
+                    pct = pct_mais_novo;
+                    continue;
+                }
+                break;
             }
 
-            xSemaphoreGive(MutexHTTP);
-
-            if (err == ESP_OK) {
-                last_sent_http = pct;
-                g_vazao_pwm_sync_pendente = false;
-
-                ESP_LOGI(TAGV, "PATCH vazao OK -> %d%%", pct);
-            } else {
-                ESP_LOGW(TAGV, "Falha PATCH vazao (%s)", esp_err_to_name(err));
-            }
+            if (xQueueReceive(vazao_sync_queue, &pct_mais_novo, pdMS_TO_TICKS(500)) == pdTRUE)
+                pct = pct_mais_novo;
         }
-
-        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
-void pwm_salvar_setpoint_percent(float percent) {
-    g_vazao_pwm_percent = clampf(percent, 0.0f, 100.0f);
+static esp_err_t pwm_nvs_salvar_setpoint(float percent) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(PWM_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+        return err;
 
-    ESP_LOGI("PWM_4A20", "Setpoint salvo = %.2f%%", (double)g_vazao_pwm_percent);
+    int32_t percent_x100 = (int32_t)lroundf(clampf(percent, 0.0f, 100.0f) * 100.0f);
+    err = nvs_set_i32(handle, PWM_NVS_SETPOINT_KEY, percent_x100);
+    if (err == ESP_OK)
+        err = nvs_commit(handle);
+
+    nvs_close(handle);
+    return err;
 }
 
-float pwm_obter_setpoint_percent(void) { return g_vazao_pwm_percent; }
+static bool pwm_nvs_carregar_setpoint(float *out_percent) {
+    if (!out_percent)
+        return false;
+
+    nvs_handle_t handle;
+    if (nvs_open(PWM_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
+        return false;
+
+    int32_t percent_x100 = 0;
+    esp_err_t err = nvs_get_i32(handle, PWM_NVS_SETPOINT_KEY, &percent_x100);
+    nvs_close(handle);
+
+    if (err != ESP_OK || percent_x100 < 0 || percent_x100 > 10000)
+        return false;
+
+    *out_percent = (float)percent_x100 / 100.0f;
+    return true;
+}
+
+void pwm_salvar_setpoint_percent(float percent) {
+    float novo_percent = clampf(percent, 0.0f, 100.0f);
+    float percent_anterior;
+
+    if (pwm_state_mutex && xSemaphoreTake(pwm_state_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW("PWM_4A20", "Setpoint nao atualizado: mutex ocupado");
+        return;
+    }
+
+    percent_anterior = g_vazao_pwm_percent;
+    g_vazao_pwm_percent = novo_percent;
+
+    if (pwm_state_mutex)
+        xSemaphoreGive(pwm_state_mutex);
+
+    if (fabsf(novo_percent - percent_anterior) >= 0.01f) {
+        esp_err_t err = pwm_nvs_salvar_setpoint(novo_percent);
+        if (err != ESP_OK)
+            ESP_LOGW("PWM_4A20", "Falha ao salvar setpoint na NVS: %s", esp_err_to_name(err));
+    }
+
+    ESP_LOGI("PWM_4A20", "Setpoint salvo = %.2f%%", (double)novo_percent);
+}
+
+float pwm_obter_setpoint_percent(void) {
+    float percent;
+
+    if (pwm_state_mutex && xSemaphoreTake(pwm_state_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        percent = g_vazao_pwm_percent;
+        xSemaphoreGive(pwm_state_mutex);
+        return percent;
+    }
+
+    return g_vazao_pwm_percent;
+}
 
 void pwm_atualizar_saida_por_estado(void) {
     static float ultimo_pct_aplicado = -1.0f;
@@ -3515,7 +4117,8 @@ void pwm_atualizar_saida_por_estado(void) {
     if (g_cfg.qtd_bombas > 0)
         saida_ativa = existe_bomba_ligada_ou_desejada();
 
-    float alvo_pct = saida_ativa ? g_vazao_pwm_percent : 0.0f;
+    float setpoint_salvo = pwm_obter_setpoint_percent();
+    float alvo_pct = saida_ativa ? setpoint_salvo : 0.0f;
 
     if ((ultima_saida_ativa == saida_ativa) && (fabsf(alvo_pct - ultimo_pct_aplicado) < 0.01f)) {
         return;
@@ -3527,23 +4130,47 @@ void pwm_atualizar_saida_por_estado(void) {
     ultima_saida_ativa = saida_ativa;
 
     ESP_LOGI("PWM_4A20", "Saida %s | Setpoint salvo=%.2f%% | Aplicado=%.2f%%", saida_ativa ? "ATIVA" : "EM REPOUSO",
-             (double)g_vazao_pwm_percent, (double)alvo_pct);
+             (double)setpoint_salvo, (double)alvo_pct);
 }
 
 void pwm_processar_novo_setpoint(float percent) {
     pwm_salvar_setpoint_percent(percent);
-    pwm_atualizar_saida_por_estado();
 }
 
 void pwm_agendar_sync_vazao(int bomba_id, float percent) {
     if (bomba_id != BOMBA_PWM_ID)
         return;
 
-    int pct = (int)(clampf(percent, 0.0f, 100.0f) + 0.5f);
+    float novo_percent = clampf(percent, 0.0f, 100.0f);
+    int pct = (int)(novo_percent + 0.5f);
 
-    g_vazao_pwm_sync_pct = pct;
-    g_vazao_pwm_sync_pendente = true;
+    if (!vazao_sync_queue) {
+        ESP_LOGW("PWM_4A20", "Fila de sync indisponivel; vazao %d%% nao agendada", pct);
+        return;
+    }
 
+    if (!pwm_state_mutex || xSemaphoreTake(pwm_state_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW("PWM_4A20", "Setpoint e fila nao atualizados: mutex indisponivel");
+        return;
+    }
+
+    float percent_anterior = g_vazao_pwm_percent;
+    g_vazao_pwm_percent = novo_percent;
+    BaseType_t queue_result = xQueueOverwrite(vazao_sync_queue, &pct);
+    xSemaphoreGive(pwm_state_mutex);
+
+    if (fabsf(novo_percent - percent_anterior) >= 0.01f) {
+        esp_err_t err = pwm_nvs_salvar_setpoint(novo_percent);
+        if (err != ESP_OK)
+            ESP_LOGW("PWM_4A20", "Falha ao salvar setpoint na NVS: %s", esp_err_to_name(err));
+    }
+
+    if (queue_result != pdPASS) {
+        ESP_LOGW("PWM_4A20", "Falha ao atualizar fila de sync da vazao");
+        return;
+    }
+
+    ESP_LOGI("PWM_4A20", "Setpoint salvo = %.2f%%", (double)novo_percent);
     ESP_LOGI("PWM_4A20", "Vazao agendada para sync: bomba=%d valor=%d%%", bomba_id, pct);
 }
 

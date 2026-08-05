@@ -11,6 +11,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 
 #include "lwip/sockets.h"
@@ -389,49 +390,77 @@ static bool tcp_connect_timeout(const char *host, int port, int timeout_ms)
         return false;
     }
 
-    int sock = socket(res->ai_family, res->ai_socktype, 0);
-    if (sock < 0)
+    bool connected = false;
+    int64_t deadline_us = esp_timer_get_time() + ((int64_t)timeout_ms * 1000);
+    int addresses_left = 0;
+    for (struct addrinfo *addr = res; addr != NULL; addr = addr->ai_next)
+        addresses_left++;
+
+    for (struct addrinfo *addr = res; addr != NULL; addr = addr->ai_next)
     {
-        freeaddrinfo(res);
-        return false;
-    }
+        int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0)
+            break;
+        int current_addresses_left = addresses_left--;
 
-    // non-blocking
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+        int sock = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+        if (sock < 0)
+            continue;
 
-    int ret = connect(sock, res->ai_addr, res->ai_addrlen);
-    if (ret < 0 && errno != EINPROGRESS)
-    {
+        int flags = fcntl(sock, F_GETFL, 0);
+        if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0)
+        {
+            close(sock);
+            continue;
+        }
+
+        int ret = connect(sock, addr->ai_addr, addr->ai_addrlen);
+        if (ret == 0)
+        {
+            connected = true;
+            close(sock);
+            break;
+        }
+
+        if (errno != EINPROGRESS)
+        {
+            close(sock);
+            continue;
+        }
+
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sock, &wfds);
+
+        remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0)
+        {
+            close(sock);
+            break;
+        }
+
+        int64_t attempt_us = remaining_us / current_addresses_left;
+        struct timeval tv = {
+            .tv_sec = (long)(attempt_us / 1000000),
+            .tv_usec = (long)(attempt_us % 1000000),
+        };
+
+        ret = select(sock + 1, NULL, &wfds, NULL, &tv);
+        if (ret > 0)
+        {
+            int so_error = 0;
+            socklen_t len = sizeof(so_error);
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len) == 0 && so_error == 0)
+                connected = true;
+        }
+
         close(sock);
-        freeaddrinfo(res);
-        return false;
+        if (connected)
+            break;
     }
 
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(sock, &wfds);
-
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-    ret = select(sock + 1, NULL, &wfds, NULL, &tv);
-    if (ret <= 0)
-    { // timeout ou erro
-        close(sock);
-        freeaddrinfo(res);
-        return false;
-    }
-
-    int so_error = 0;
-    socklen_t len = sizeof(so_error);
-    getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
-
-    close(sock);
     freeaddrinfo(res);
-
-    return (so_error == 0);
+    return connected;
 }
 
 // ✅ MESMA ASSINATURA, AGORA TCP REAL

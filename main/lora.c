@@ -119,13 +119,28 @@ esp_err_t lora_e32_init(const lora_e32_config_t *cfg)
 
     if (!g_uart_installed)
     {
-        ESP_ERROR_CHECK(uart_driver_install(g_cfg.uart_num, 2048, 2048, 0, NULL, 0));
+        esp_err_t err = uart_driver_install(g_cfg.uart_num, 2048, 2048, 0, NULL, 0);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "uart_driver_install falhou: %s", esp_err_to_name(err));
+            return err;
+        }
         g_uart_installed = true;
     }
 
-    ESP_ERROR_CHECK(uart_param_config(g_cfg.uart_num, &uc));
-    ESP_ERROR_CHECK(uart_set_pin(g_cfg.uart_num, g_cfg.tx_pin, g_cfg.rx_pin,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    esp_err_t err = uart_param_config(g_cfg.uart_num, &uc);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "uart_param_config falhou: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = uart_set_pin(g_cfg.uart_num, g_cfg.tx_pin, g_cfg.rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "uart_set_pin falhou: %s", esp_err_to_name(err));
+        return err;
+    }
 
     // Reset (se existir)
     hw_reset_if_any();
@@ -137,7 +152,38 @@ esp_err_t lora_e32_init(const lora_e32_config_t *cfg)
     return ESP_OK;
 }
 
-esp_err_t lora_e32_apply_cfg(void)
+esp_err_t lora_e32_reinit(void)
+{
+    return lora_e32_init(&g_cfg);
+}
+
+static bool cfg_response_matches(const uint8_t *resp, int len, const uint8_t *cmd)
+{
+    for (int offset = 0; offset + 6 <= len; offset++)
+    {
+        uint8_t response_head = resp[offset];
+        bool known_head = response_head == 0xC0 || response_head == 0xC1 || response_head == 0xC2;
+
+        bool same_address = resp[offset + 1] == cmd[1] && resp[offset + 2] == cmd[2];
+        bool same_radio = resp[offset + 4] == cmd[4] && resp[offset + 5] == cmd[5];
+        bool speed_matches = resp[offset + 3] == cmd[3];
+
+        // A rede instalada usa 0x18. Algumas revisoes do E32 mantem/retornam
+        // 0x1A; isso nao deve bloquear a UART nem a recepcao dos frames legados.
+        if (cmd[3] == 0x18 && resp[offset + 3] == 0x1A)
+        {
+            speed_matches = true;
+            ESP_LOGW(TAG, "E32 retornou SPED=0x1A para a configuracao legada 0x18; mantendo radio disponivel");
+        }
+
+        if (known_head && same_address && speed_matches && same_radio)
+            return true;
+    }
+
+    return false;
+}
+
+static esp_err_t lora_e32_apply_cfg_with_head(uint8_t head)
 {
     g_rx_stream_len = 0;
 
@@ -146,16 +192,25 @@ esp_err_t lora_e32_apply_cfg(void)
     vTaskDelay(pdMS_TO_TICKS(200)); // CRÍTICO
 
     uint8_t cmd[6] = {
-        g_cfg.head,
+        head,
         g_cfg.addh,
         g_cfg.addl,
         g_cfg.speed,
         g_cfg.channel,
         g_cfg.option};
 
-    uart_flush_input(g_cfg.uart_num);
-    uart_write_bytes(g_cfg.uart_num, (const char *)cmd, sizeof(cmd));
-    uart_wait_tx_done(g_cfg.uart_num, pdMS_TO_TICKS(500));
+    esp_err_t flush_err = uart_flush_input(g_cfg.uart_num);
+    int written = uart_write_bytes(g_cfg.uart_num, (const char *)cmd, sizeof(cmd));
+    esp_err_t tx_err = uart_wait_tx_done(g_cfg.uart_num, pdMS_TO_TICKS(500));
+
+    if (flush_err != ESP_OK || written != (int)sizeof(cmd) || tx_err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "falha ao gravar cfg: flush=%s written=%d/%u tx=%s",
+                 esp_err_to_name(flush_err), written, (unsigned)sizeof(cmd), esp_err_to_name(tx_err));
+        set_mode_normal();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        return (tx_err != ESP_OK) ? tx_err : ESP_FAIL;
+    }
 
     vTaskDelay(pdMS_TO_TICKS(300)); // CRÍTICO (gravação interna)
 
@@ -179,10 +234,28 @@ esp_err_t lora_e32_apply_cfg(void)
     set_mode_normal();
     vTaskDelay(pdMS_TO_TICKS(500)); // CRÍTICO: pronto p/ TX/RX
 
+    if (!cfg_response_matches(resp, r, cmd))
+    {
+        ESP_LOGE(TAG,
+                 "resposta de configuracao E32 invalida: bytes=%d parametros esperados=%02X %02X %02X %02X %02X",
+                 r, cmd[1], cmd[2], cmd[3], cmd[4], cmd[5]);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
     ESP_LOGI(TAG, "radio cfg applied: %02X %02X %02X %02X %02X %02X",
              cmd[0], cmd[1], cmd[2], cmd[3], cmd[4], cmd[5]);
 
     return ESP_OK;
+}
+
+esp_err_t lora_e32_apply_cfg(void)
+{
+    return lora_e32_apply_cfg_with_head(g_cfg.head);
+}
+
+esp_err_t lora_e32_apply_cfg_temp(void)
+{
+    return lora_e32_apply_cfg_with_head(0xC2);
 }
 
 int lora_e32_send_raw(const uint8_t *data, int len)

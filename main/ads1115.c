@@ -61,7 +61,8 @@ esp_err_t ads1115_init(ads1115_t *ads, i2c_master_dev_handle_t dev_handle)
 
   *ads = (ads1115_t){0};
   ads->dev_handle = dev_handle;
-  ads->max_ticks = pdMS_TO_TICKS(100);
+  // O driver I2C novo recebe timeout em milissegundos.
+  ads->max_ticks = 100;
 
   // Default “seguro” pra 4-20mA:
   ads->config.reg = 0;

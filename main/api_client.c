@@ -1,6 +1,7 @@
 #include "api_client.h"
 #include "esp_log.h"
 #include "cJSON.h"
+#include "esp_task_wdt.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -46,6 +47,9 @@ typedef struct
 // Handler de eventos HTTP (apenas pra receber dados)
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
+    if (evt->event_id == HTTP_EVENT_ON_CONNECTED || evt->event_id == HTTP_EVENT_ON_FINISH)
+        (void)esp_task_wdt_reset();
+
     http_rx_ctx_t *rx = (http_rx_ctx_t *)evt->user_data;
     if (!rx)
         return ESP_OK;

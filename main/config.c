@@ -53,9 +53,6 @@ TaskHandle_t g_lora_app_task_handle = NULL;
 volatile bool g_comando_bomba_desejado = false; // último comando recebido (liga/desliga)
 volatile float g_vazao_pwm_percent = 0.0f;      // último setpoint salvo
 
-volatile int g_vazao_pwm_sync_pct = 0;
-volatile bool g_vazao_pwm_sync_pendente = false;
-
 const char *rootCaCerticate = "-----BEGIN CERTIFICATE-----\n"
                               "MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw\n"
                               "TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh\n"
@@ -360,6 +357,37 @@ esp_err_t cfg_save(const device_cfg_t *cfg) {
     nvs_close(h);
     if (err == ESP_OK)
         cfg_apply_runtime(cfg);
+    return err;
+}
+
+esp_err_t cfg_save_level_limits(int nivel_minimo, int nivel_maximo) {
+    if (nivel_minimo < 0 || nivel_minimo > 100 || nivel_maximo < 0 || nivel_maximo > 100 ||
+        nivel_minimo >= nivel_maximo) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (g_cfg.nivel_minimo == nivel_minimo && g_cfg.nivel_maximo == nivel_maximo)
+        return ESP_OK;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK)
+        return err;
+
+    err = nvs_set_i32(h, "nmin", nivel_minimo);
+    if (err == ESP_OK)
+        err = nvs_set_i32(h, "nmax", nivel_maximo);
+    if (err == ESP_OK)
+        err = nvs_commit(h);
+
+    nvs_close(h);
+
+    if (err == ESP_OK) {
+        g_cfg.nivel_minimo = nivel_minimo;
+        g_cfg.nivel_maximo = nivel_maximo;
+        ESP_LOGI(TAG_CFG, "Limites de nivel salvos na NVS: min=%d max=%d", nivel_minimo, nivel_maximo);
+    }
+
     return err;
 }
 

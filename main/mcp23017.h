@@ -37,6 +37,7 @@
 /*===================================================================================*/
 uint8_t InitMcp(i2c_master_dev_handle_t dev_handle);
 uint8_t WritePinMcp(i2c_master_dev_handle_t dev_handle, uint8_t Port, uint8_t Pin, uint8_t Value);
+int16_t ReadRegisterMcp(i2c_master_dev_handle_t dev_handle, uint8_t Register);
 int8_t ReadPinMcp(i2c_master_dev_handle_t dev_handle, uint8_t Port, uint8_t Pin);
 /*===================================================================================*/
 #endif //__MCP23017_H__

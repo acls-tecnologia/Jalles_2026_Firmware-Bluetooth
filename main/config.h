@@ -172,9 +172,6 @@ typedef struct {
 
 #define CFG_PROVISION_INTERVAL_MS (24ULL * 60ULL * 60ULL * 1000ULL) // 24 horas
 
-extern volatile int g_vazao_pwm_sync_pct;
-extern volatile bool g_vazao_pwm_sync_pendente;
-
 void pwm_agendar_sync_vazao(int bomba_id, float percent);
 
 extern device_cfg_t g_cfg; // configuração global do dispositivo
@@ -198,6 +195,8 @@ void pwm_processar_novo_setpoint(float percent);
 bool sincronizar_status_bomba_real(int idx);
 bool enviar_alerta_bomba_api_online(int idx, const char *evento, const char *motivo);
 void bomba_registrar_controle_id(int idx, int controle_id);
+bool bomba_solicitar_comando(int idx, bool desejado, const char *origem);
+bool bomba_seguranca_pronta(void);
 
 //============================================================
 
@@ -206,6 +205,7 @@ void bomba_registrar_controle_id(int idx, int controle_id);
 esp_err_t cfg_nvs_init(void);                // inicializa NVS para configuração
 bool cfg_load(device_cfg_t *out);            // carrega configuração da NVS
 esp_err_t cfg_save(const device_cfg_t *cfg); /// salva configuração na NVS
+esp_err_t cfg_save_level_limits(int nivel_minimo, int nivel_maximo);
 void cfg_apply_runtime(const device_cfg_t *cfg);
 bool cfg_wifi_load(void);
 esp_err_t cfg_wifi_save(const char *ssid, const char *password);
@@ -302,6 +302,7 @@ extern EventGroupHandle_t sys_event_group; // event group global do sistema
 #define EVT_EMERGENCIA_BIT BIT4            // emergência acionada
 #define EVT_LOCAL_REMOTO_BIT BIT5          // modo local/remoto alterado
 #define EVT_STATUS_BOMBA_BIT BIT6          // status da bomba alterado
+#define SYS_WS_RESTART_BIT BIT7             // reinicia o WebSocket depois de renovar o token
 
 /* ======================= PWM ======================= */
 #define PWM_GPIO 26
@@ -446,17 +447,18 @@ extern SemaphoreHandle_t g_lora_ack_mutex;
 
 #define LORA_RX_APP_QUEUE_LEN 24
 
-#define LORA_DUP_WINDOW_MS 15000
+#define LORA_DUP_WINDOW_MS (2U * 60U * 1000U)
 #define LORA_RX_READ_TIMEOUT_MS 800
 #define LORA_RX_IDLE_DELAY_MS 50
 #define LORA_ACK_SEND_TIMEOUT_MS 2500
 #define LORA_POST_TX_GUARD_MS 120
 
 #define GPIO_OUTPUT_IO_22 22
-#define LORA_ACK_TIMEOUT_MS 15000
-#define LORA_MAX_RETRIES 5
+#define LORA_ACK_TIMEOUT_MS 10000
+#define LORA_MAX_RETRIES 10
 #define LORA_RETRY_BACKOFF_MIN_MS 2500
 #define LORA_RETRY_BACKOFF_JITTER_MS 7000
+#define LORA_FAILURES_BEFORE_RECOVERY 1
 
 #define DEVICE_TYPE DEV_TANK
 
@@ -478,7 +480,7 @@ typedef struct __attribute__((packed)) {
     uint8_t dst_type; // destino
     uint16_t dst_id;  // id destino
     uint8_t msg_type; // DATA, CMD, ACK
-    uint8_t msg_id;   // contador
+    uint8_t msg_id;  // contador legado usado pelos tanques instalados
     uint8_t len;      // tamanho payload
 
     uint8_t has_bomba_id; // 0 = não tem | 1 = tem

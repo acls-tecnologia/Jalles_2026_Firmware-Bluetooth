@@ -110,42 +110,59 @@ static void websocket_event_handler(void *handler_args,
                     cJSON *controleId = cJSON_GetObjectItem(data, "id");
                     cJSON *bombaId = cJSON_GetObjectItem(data, "bombaId");
                     cJSON *vazao = cJSON_GetObjectItemCaseSensitive(data, "vazao");
-
-                    // Se não vier bombaId, trata como broadcast
-                    bool broadcast = !cJSON_IsNumber(bombaId);
-                    int idx = 0;
-
-                    if (!broadcast)
-                    {
-                        idx = ws_bomba_index_from_id(bombaId->valueint);
-                        if (idx < 0)
-                        {
-                            ESP_LOGW(TAG,
-                                     "WS: bombaId=%d nao pertence a este tanque -> ignorado",
-                                     bombaId->valueint);
-                            cJSON_Delete(root);
-                            break;
-                        }
-
-                        bomba_registrar_controle_id(idx, cJSON_IsNumber(controleId) ? controleId->valueint : bombaId->valueint);
-                    }
-
-                    // status vindo do front
                     cJSON *st = cJSON_GetObjectItem(data, "stausBOmba");
                     if (!st)
                         st = cJSON_GetObjectItem(data, "statusBomba");
+
+                    if (!cJSON_IsBool(comando) || !cJSON_IsNumber(bombaId) || bombaId->valueint <= 0 ||
+                        bombaId->valuedouble != (double)bombaId->valueint)
+                    {
+                        ESP_LOGW(TAG, "WS: mensagem incompleta descartada (comando e bombaId sao obrigatorios)");
+                        cJSON_Delete(root);
+                        break;
+                    }
+
+                    int idx = ws_bomba_index_from_id(bombaId->valueint);
+                    if (idx < 0)
+                    {
+                        ESP_LOGW(TAG, "WS: bombaId=%d nao pertence a este tanque -> ignorado", bombaId->valueint);
+                        cJSON_Delete(root);
+                        break;
+                    }
+
+                    bool executar_comando = cJSON_IsTrue(comando);
+                    bool status_valido = cJSON_IsNumber(st) &&
+                                          (st->valuedouble == 0.0 || st->valuedouble == 1.0);
+                    bool tem_vazao = cJSON_IsNumber(vazao);
+                    bool vazao_valida = tem_vazao && vazao->valuedouble >= 0.0 && vazao->valuedouble <= 100.0;
+                    bool ajuste_vazao_valido = vazao_valida && bombaId->valueint == BOMBA_PWM_ID;
+
+                    if ((tem_vazao && !vazao_valida) || (executar_comando && !status_valido) ||
+                        (!executar_comando && !ajuste_vazao_valido))
+                    {
+                        ESP_LOGW(TAG,
+                                 "WS: mensagem incompleta/invalida descartada para bombaId=%d (comando=%d status=%d vazao=%d)",
+                                 bombaId->valueint,
+                                 executar_comando ? 1 : 0,
+                                 status_valido ? 1 : 0,
+                                 vazao_valida ? 1 : 0);
+                        cJSON_Delete(root);
+                        break;
+                    }
+
+                    bomba_registrar_controle_id(idx,
+                                                cJSON_IsNumber(controleId) ? controleId->valueint : bombaId->valueint);
 
                     // ------------------------------------------------------
                     // 1) Se veio vazao, salva/aplica o setpoint
                     //    MAS NAO SAI DO HANDLER
                     // ------------------------------------------------------
-                    if (vazao && cJSON_IsNumber(vazao))
+                    if (tem_vazao)
                     {
                         float valor_vazao = (float)vazao->valuedouble;
 
-                        if (!broadcast && bombaId->valueint == BOMBA_PWM_ID)
+                        if (bombaId->valueint == BOMBA_PWM_ID)
                         {
-                            pwm_processar_novo_setpoint(valor_vazao);
                             pwm_agendar_sync_vazao(bombaId->valueint, valor_vazao);
 
                             ESP_LOGI(TAG,
@@ -157,7 +174,7 @@ static void websocket_event_handler(void *handler_args,
                         {
                             ESP_LOGI(TAG,
                                      "WS: vazao ignorada para bombaId=%d (nao eh a bomba PWM)",
-                                     broadcast ? -1 : bombaId->valueint);
+                                     bombaId->valueint);
                         }
                     }
 
@@ -166,22 +183,10 @@ static void websocket_event_handler(void *handler_args,
                     // ------------------------------------------------------
                     if (cJSON_IsBool(comando) && cJSON_IsTrue(comando))
                     {
-                        if (broadcast)
-                        {
-                            for (int i = 0; i < g_cfg.qtd_bombas && i < MAX_BOMBAS; i++)
-                                g_controle_bomba_habilitado[i] = true;
-
-                            ESP_LOGW(TAG, "Controle habilitado=1 (broadcast)");
-                        }
-                        else
-                        {
-                            g_controle_bomba_habilitado[idx] = true;
-
-                            ESP_LOGW(TAG,
-                                     "Controle habilitado=1 (idx=%d id=%d)",
-                                     idx,
-                                     g_cfg.bomba_id[idx]);
-                        }
+                        ESP_LOGW(TAG,
+                                 "Comando recebido (idx=%d id=%d)",
+                                 idx,
+                                 g_cfg.bomba_id[idx]);
 
                         if (cJSON_IsNumber(st))
                         {
@@ -189,8 +194,8 @@ static void websocket_event_handler(void *handler_args,
                             bool esta_ligada_front = (status_atual == 1);
                             bool desejado = !esta_ligada_front; // toggle
 
-                            int start = broadcast ? 0 : idx;
-                            int end = broadcast ? (int)g_cfg.qtd_bombas : (idx + 1);
+                            int start = idx;
+                            int end = idx + 1;
 
                             bool emerg_global_ativa = false;
                             for (int k = 0; k < g_cfg.qtd_bombas && k < MAX_BOMBAS; k++)
@@ -209,7 +214,6 @@ static void websocket_event_handler(void *handler_args,
                                 bool real_ligada = g_status_bomba[i] ? true : false;
 
                                 bool pode_processar_cmd =
-                                    ctrl &&
                                     remoto_ativo &&
                                     !emerg_global_ativa;
 
@@ -260,7 +264,14 @@ static void websocket_event_handler(void *handler_args,
                                     }
                                     else
                                     {
-                                        g_status_bomba_desejado[i] = desejado;
+                                        if (!bomba_solicitar_comando(i, desejado, "WebSocket"))
+                                        {
+                                            ESP_LOGW(TAG,
+                                                     "WS: comando rejeitado pela seguranca (i=%d id=%d)",
+                                                     i,
+                                                     g_cfg.bomba_id[i]);
+                                            continue;
+                                        }
 
                                         ESP_LOGW(TAG,
                                                  "WS: bomba i=%d id=%d front=%s -> comando=%s",
@@ -289,7 +300,6 @@ static void websocket_event_handler(void *handler_args,
                         ESP_LOGI(TAG, "WS: sem comando de bomba (comando=false ou ausente)");
                     }
 
-                    pwm_atualizar_saida_por_estado();
                 }
             }
 

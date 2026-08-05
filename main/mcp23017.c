@@ -33,6 +33,7 @@
 
 #define INPUT 0xff
 #define OUTPUT 0x00
+#define MCP_I2C_TIMEOUT_MS 200
 
 /*===================================================================================*/
 /**
@@ -45,7 +46,7 @@
 uint8_t WriteRegisterMcp(i2c_master_dev_handle_t dev_handle, uint8_t Register, uint8_t Value)
 {
     uint8_t data[2] = {Register, Value};
-    esp_err_t err = i2c_master_transmit(dev_handle, data, sizeof(data), 1000 / portTICK_PERIOD_MS);
+    esp_err_t err = i2c_master_transmit(dev_handle, data, sizeof(data), MCP_I2C_TIMEOUT_MS);
 
     if (err != ESP_OK)
     {
@@ -63,10 +64,11 @@ uint8_t WriteRegisterMcp(i2c_master_dev_handle_t dev_handle, uint8_t Register, u
  * @param dev_handle  Handle do dispositivo MCP23017
  * @param Register    Registrador interno do MCP a ser lido
  */
-uint8_t ReadRegisterMcp(i2c_master_dev_handle_t dev_handle, uint8_t Register)
+int16_t ReadRegisterMcp(i2c_master_dev_handle_t dev_handle, uint8_t Register)
 {
     uint8_t read_data = 0;
-    esp_err_t err = i2c_master_transmit_receive(dev_handle, &Register, 1, &read_data, 1, 1000 / portTICK_PERIOD_MS);
+    esp_err_t err =
+        i2c_master_transmit_receive(dev_handle, &Register, 1, &read_data, 1, MCP_I2C_TIMEOUT_MS);
 
     if (err != ESP_OK)
     {
@@ -74,7 +76,7 @@ uint8_t ReadRegisterMcp(i2c_master_dev_handle_t dev_handle, uint8_t Register)
         return -1;
     }
 
-    return (int16_t)read_data;
+    return read_data;
 }
 
 /*===================================================================================*/
@@ -133,6 +135,9 @@ uint8_t WritePinMcp(i2c_master_dev_handle_t dev_handle, uint8_t Port, uint8_t Pi
         Buffer &= ~(1 << Pin);
     else
         Buffer |= (1 << Pin);
+
+    if (Buffer == (uint8_t)r)
+        return 0;
 
     if (WriteRegisterMcp(dev_handle, Port, Buffer))
     {

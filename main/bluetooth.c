@@ -14,6 +14,7 @@
 #include "freertos/timers.h"
 #include "host/ble_hs.h"
 #include "host/ble_hs_mbuf.h"
+#include "host/ble_store.h"
 #include "host/ble_uuid.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -38,6 +39,7 @@ static bool ble_stack_started = false;
 static bool ble_stack_stopping = false;
 static bool ble_window_open = false;
 static bool notify_enabled = false;
+static bool link_encrypted = false;
 
 static char last_status[512] = "{\"ok\":true,\"status\":\"idle\"}";
 
@@ -48,6 +50,7 @@ static TimerHandle_t ble_window_timer = NULL;
 static void ble_advertise(void);
 static void ble_advertise_async(void);
 static void ble_stop_async(void);
+void ble_store_config_init(void);
 
 static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
 
@@ -59,13 +62,13 @@ static const struct ble_gatt_svc_def gatt_services[] = {
             {
                 .uuid = BLE_UUID16_DECLARE(TANK_BLE_RX_UUID),
                 .access_cb = gatt_access_cb,
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC,
             },
             {
                 .uuid = BLE_UUID16_DECLARE(TANK_BLE_TX_UUID),
                 .access_cb = gatt_access_cb,
                 .val_handle = &tx_val_handle,
-                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ_ENC,
             },
             {0},
         },
@@ -78,7 +81,7 @@ static void set_status(const char *status) {
 }
 
 static void notify_status(void) {
-    if (!ble_window_open || active_conn_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled)
+    if (!ble_window_open || active_conn_handle == BLE_HS_CONN_HANDLE_NONE || !link_encrypted || !notify_enabled)
         return;
 
     struct os_mbuf *om = ble_hs_mbuf_from_flat(last_status, strlen(last_status));
@@ -130,13 +133,22 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             active_conn_handle = event->connect.conn_handle;
-            if (ble_window_timer)
-                xTimerStop(ble_window_timer, 0);
+            link_encrypted = false;
+            if (ble_window_timer) {
+                xTimerChangePeriod(ble_window_timer, pdMS_TO_TICKS(30000), 0);
+                xTimerStart(ble_window_timer, 0);
+            }
 
-            bt_client_connected_callback();
-            ESP_LOGI(BLE_TAG, "Cliente BLE conectado");
+            int rc = ble_gap_security_initiate(active_conn_handle);
+            if (rc != 0 && rc != BLE_HS_EALREADY) {
+                ESP_LOGE(BLE_TAG, "Falha ao iniciar pareamento BLE: %d", rc);
+                ble_gap_terminate(active_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            } else {
+                ESP_LOGI(BLE_TAG, "Cliente BLE conectado; iniciando pareamento criptografado");
+            }
         } else {
             active_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            link_encrypted = false;
             notify_enabled = false;
             if (ble_window_open)
                 ble_advertise_async();
@@ -146,11 +158,36 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(BLE_TAG, "Cliente BLE desconectado");
         active_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        link_encrypted = false;
         notify_enabled = false;
         bt_client_disconnected_callback();
         if (ble_window_open)
             ble_stop_async();
         break;
+
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        if (event->enc_change.status == 0) {
+            link_encrypted = true;
+            bt_client_connected_callback();
+            ESP_LOGI(BLE_TAG, "Pareamento BLE concluido; conexao criptografada");
+        } else {
+            ESP_LOGE(BLE_TAG, "Falha na criptografia BLE: %d", event->enc_change.status);
+            ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        break;
+
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        struct ble_gap_conn_desc desc;
+        int rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
+        if (rc != 0) {
+            ESP_LOGE(BLE_TAG, "Falha ao localizar peer para novo pareamento: %d", rc);
+            return rc;
+        }
+
+        ble_store_util_delete_peer(&desc.peer_id_addr);
+        ESP_LOGW(BLE_TAG, "Bond antigo removido; repetindo pareamento");
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
         if (ble_window_open)
@@ -260,7 +297,12 @@ static void ble_on_reset(int reason) {
 
 static void ble_window_timeout_cb(TimerHandle_t timer) {
     if (active_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        ESP_LOGI(BLE_TAG, "Timeout BLE ignorado: cliente conectado");
+        if (!link_encrypted) {
+            ESP_LOGW(BLE_TAG, "Timeout de pareamento BLE; encerrando cliente nao autenticado");
+            ble_gap_terminate(active_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        } else {
+            ESP_LOGI(BLE_TAG, "Timeout BLE ignorado: cliente pareado conectado");
+        }
         return;
     }
 
@@ -314,10 +356,18 @@ esp_err_t bluetooth_config_start(uint32_t timeout_ms) {
 
         ble_hs_cfg.reset_cb = ble_on_reset;
         ble_hs_cfg.sync_cb = ble_on_sync;
+        ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+        ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
+        ble_hs_cfg.sm_bonding = 1;
+        ble_hs_cfg.sm_mitm = 0;
+        ble_hs_cfg.sm_sc = 1;
+        ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+        ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
 
         ble_svc_gap_init();
         ble_svc_gatt_init();
         ble_svc_gap_device_name_set(TANK_BLE_DEVICE_NAME);
+        ble_store_config_init();
 
         int rc = ble_gatts_count_cfg(gatt_services);
         if (rc == 0)
@@ -352,6 +402,7 @@ void bluetooth_config_stop(void) {
 
     ble_window_open = false;
     notify_enabled = false;
+    link_encrypted = false;
 
     if (ble_window_timer)
         xTimerStop(ble_window_timer, 0);
