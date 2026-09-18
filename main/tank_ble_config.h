@@ -2,6 +2,8 @@
 #define TANK_BLE_CONFIG_H
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 typedef void (*tank_ble_send_fn_t)(const char *message);
 
@@ -12,5 +14,6 @@ typedef void (*tank_ble_send_fn_t)(const char *message);
 
 void tank_ble_config_send_snapshot(tank_ble_send_fn_t send_fn);
 void tank_ble_config_handle_message(const char *message, tank_ble_send_fn_t send_fn);
+void tank_ble_config_handle_binary(const uint8_t *data, size_t length, tank_ble_send_fn_t send_fn);
 
 #endif

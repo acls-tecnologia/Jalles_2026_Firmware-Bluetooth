@@ -1,5 +1,6 @@
 #include "bluetooth.h"
 #include "config.h" // Inclui o arquivo de configuração
+#include "firmware_ota.h"
 #include "esp_err.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
@@ -301,6 +302,11 @@ void app_main(void) {
     ESP_LOGW("RESET", "Ultimo reset reason = %d", esp_reset_reason());
 
     ESP_ERROR_CHECK(cfg_nvs_init());
+    ESP_ERROR_CHECK(firmware_ota_init());
+    esp_err_t fw_validation_err = firmware_ota_schedule_validation(30000);
+    if (fw_validation_err != ESP_OK) {
+        ESP_LOGE("FW_OTA", "Falha ao agendar validacao da imagem OTA: %s", esp_err_to_name(fw_validation_err));
+    }
 
     bool tem_wifi = cfg_wifi_load();
     if (!tem_wifi) {
@@ -836,6 +842,7 @@ void wifi_task(void *pv) {
     bool was_online = false;
     bool ws_stopped = false;
     bool first_online_done = false;
+    bool ota_check_scheduled = false;
 
     int fails_internet = 0;
 
@@ -1001,6 +1008,15 @@ void wifi_task(void *pv) {
 
                     ESP_LOGI(TAG_WIFI, "ONLINE (AP + IP + reachability OK)");
                     wifi_print_info();
+                }
+                if (!ota_check_scheduled) {
+                    esp_err_t ota_err = firmware_ota_check_for_update_async();
+                    if (ota_err == ESP_OK) {
+                        ota_check_scheduled = true;
+                        ESP_LOGI(TAG_WIFI, "Verificacao OTA do arquivo %d agendada", OTA_FILE_ID);
+                    } else {
+                        ESP_LOGW(TAG_WIFI, "Nao foi possivel agendar verificacao OTA: %s", esp_err_to_name(ota_err));
+                    }
                 }
             } else {
                 fails_internet++;
@@ -3232,6 +3248,7 @@ static void tanque_process_cmd_from_gtw(const lora_app_frame_t *rx) {
     }
 
     cJSON *cmd = cJSON_GetObjectItemCaseSensitive(root, "cmd");
+
     cJSON *status = cJSON_GetObjectItemCaseSensitive(root, "status");
     if (!status)
         status = cJSON_GetObjectItemCaseSensitive(root, "s");
@@ -3247,7 +3264,7 @@ static void tanque_process_cmd_from_gtw(const lora_app_frame_t *rx) {
                            (executar->valuedouble == 0.0 || executar->valuedouble == 1.0);
     bool comando_explicito = cJSON_IsBool(executar) || q_numero_valido;
     bool executar_comando = cJSON_IsTrue(executar) || (cJSON_IsNumber(executar) && executar->valueint != 0);
-    bool eh_bomba_pwm = rx->has_bomba_id && (rx->bomba_id == BOMBA_PWM_ID);
+    bool eh_bomba_pwm = rx->has_bomba_id && tanque_bomba_eh_pwm(rx->bomba_id);
 
     if (!rx->has_bomba_id || bomba_index_from_id(rx->bomba_id) < 0) {
         ESP_LOGW("LORA", "Comando incompleto/estranho descartado: bomba ausente ou nao configurada (id=%u has=%u)",
@@ -3303,7 +3320,8 @@ static void tanque_process_cmd_from_gtw(const lora_app_frame_t *rx) {
         ESP_LOGI("LORA", "Setpoint PWM recebido via LoRa -> bomba_id=%u valor=%.2f%%", rx->bomba_id,
                  (double)valor_vazao);
     } else if (tem_vazao && rx->has_bomba_id && !eh_bomba_pwm) {
-        ESP_LOGI("LORA", "Vazao ignorada -> bomba_id=%u nao eh a bomba PWM (%u)", rx->bomba_id, BOMBA_PWM_ID);
+        ESP_LOGI("LORA", "Vazao ignorada -> bomba_id=%u nao eh a bomba PWM (%d)", rx->bomba_id,
+                 tanque_bomba_pwm_id());
     }
 
     bool processa_cmd = tem_cmd_bomba;
@@ -3556,7 +3574,6 @@ void tanque_lora_rx_task(void *pv) {
             tanque_lora_log_rx_stats(&stats, "app_queue_drop");
         } else {
             stats.app_queue_ok++;
-
             if (should_ack_payload) {
                 tanque_send_ack(&rx);
                 stats.ack_sent_for_payload++;
@@ -3989,7 +4006,9 @@ void vazao_sync_task(void *pv) {
                 if (pct == last_sent_lora) {
                     concluido = true;
                 } else {
-                    bool ok = lora_enqueue_json_bomba_int((uint16_t)BOMBA_PWM_ID, "vazao", pct);
+                    int bomba_pwm_id = tanque_bomba_pwm_id();
+                    bool ok = bomba_pwm_id > 0 &&
+                              lora_enqueue_json_bomba_int((uint16_t)bomba_pwm_id, "vazao", pct);
                     if (ok) {
                         last_sent_lora = pct;
                         concluido = true;
@@ -4007,7 +4026,9 @@ void vazao_sync_task(void *pv) {
 
                     if (patch) {
                         cJSON_AddNumberToObject(patch, "vazao", pct);
-                        err = api_patch_bomba(BOMBA_PWM_ID, patch);
+                        int bomba_pwm_id = tanque_bomba_pwm_id();
+                        if (bomba_pwm_id > 0)
+                            err = api_patch_bomba(bomba_pwm_id, patch);
                         cJSON_Delete(patch);
                     }
 
@@ -4138,7 +4159,7 @@ void pwm_processar_novo_setpoint(float percent) {
 }
 
 void pwm_agendar_sync_vazao(int bomba_id, float percent) {
-    if (bomba_id != BOMBA_PWM_ID)
+    if (!tanque_bomba_eh_pwm(bomba_id))
         return;
 
     float novo_percent = clampf(percent, 0.0f, 100.0f);

@@ -24,6 +24,7 @@
 #include "api_client.h"
 #include "watchdog_rtc_raw.h"
 #include "ws_client.h"
+#include "ota_secret.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -42,6 +43,15 @@
 //============== CONFIGURAÇÕES GERAIS DO PROJETO ==============
 
 #define DEBUG_MODE 0 // ou 1 para ativar logs
+
+// Firmware do tanque publicado no backend.
+#define GTW_USE_IPV6 0
+#define OTA_FILE_ID 6
+#define OTA_METADATA_URL "https://jalles.aclsconnect.com/67ZlfPVt/files/Leitura/6"
+#define OTA_DOWNLOAD_URL "https://jalles.aclsconnect.com/67ZlfPVt/files/download/6"
+#define OTA_HTTP_TIMEOUT_MS 30000
+#define OTA_CHECK_RETRY_DELAY_MS 30000
+#define OTA_CHECK_MAX_ATTEMPTS 3
 
 //============== Definições da API ==============
 
@@ -80,6 +90,7 @@
 
 #define API_USER_MAX_LEN 32
 #define API_PASS_MAX_LEN 48
+#define DEFAULT_API_PASSWORD "hER49}W2:ql~\xC2\xA3P94Y9WN"
 
 extern char g_api_user[API_USER_MAX_LEN];
 extern char g_api_pass[API_PASS_MAX_LEN];
@@ -90,12 +101,15 @@ extern int g_lora_gtw_id;
 #define API_PASS g_api_pass
 #define DEVICE_ID g_api_user
 
-// static const char API_PASS[] = "hER49}W2:ql~£P94Y9WN"; // Senha do dispositivo na API
 #define NOME_CURTO ((g_cfg.nome_tanque[0] != '\0') ? g_cfg.nome_tanque : g_api_user)
 
 #define PROVISION_TANQUE_ID g_provision_tanque_id // ID do Tanque
 
-#define BOMBA_PWM_ID 42 // ID da bomba para ser modulada
+// Bombas com inversor de frequencia, selecionadas conforme o tanque provisionado.
+#define TANQUE_RD0_ID 63
+#define BOMBA_PWM_RD0_ID 42
+#define TANQUE_BOOSTER_ID 84
+#define BOMBA_PWM_BOOSTER_ID 62
 
 #define LORA_GTW_ID g_lora_gtw_id // ID Gateway configuravel
 // #define LORA_GTW_ID 2 // ID Gateway UOL
@@ -175,6 +189,9 @@ typedef struct {
 void pwm_agendar_sync_vazao(int bomba_id, float percent);
 
 extern device_cfg_t g_cfg; // configuração global do dispositivo
+
+int tanque_bomba_pwm_id(void);
+bool tanque_bomba_eh_pwm(int bomba_id);
 
 extern volatile int g_local_remoto[MAX_BOMBAS];           // 0=Local, 1=Remoto
 extern volatile int g_emergencia[MAX_BOMBAS];             // espelha a emergência única do tanque em todas as posições

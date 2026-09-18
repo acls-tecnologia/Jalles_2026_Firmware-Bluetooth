@@ -135,7 +135,7 @@ static void websocket_event_handler(void *handler_args,
                                           (st->valuedouble == 0.0 || st->valuedouble == 1.0);
                     bool tem_vazao = cJSON_IsNumber(vazao);
                     bool vazao_valida = tem_vazao && vazao->valuedouble >= 0.0 && vazao->valuedouble <= 100.0;
-                    bool ajuste_vazao_valido = vazao_valida && bombaId->valueint == BOMBA_PWM_ID;
+                    bool ajuste_vazao_valido = vazao_valida && tanque_bomba_eh_pwm(bombaId->valueint);
 
                     if ((tem_vazao && !vazao_valida) || (executar_comando && !status_valido) ||
                         (!executar_comando && !ajuste_vazao_valido))
@@ -161,7 +161,7 @@ static void websocket_event_handler(void *handler_args,
                     {
                         float valor_vazao = (float)vazao->valuedouble;
 
-                        if (bombaId->valueint == BOMBA_PWM_ID)
+                        if (tanque_bomba_eh_pwm(bombaId->valueint))
                         {
                             pwm_agendar_sync_vazao(bombaId->valueint, valor_vazao);
 

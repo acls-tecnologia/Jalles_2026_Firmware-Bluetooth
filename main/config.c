@@ -19,6 +19,24 @@ static const char *NVS_WIFI_NS = "wifi_cfg";
 // Global
 device_cfg_t g_cfg = {0};
 
+int tanque_bomba_pwm_id(void) {
+    int tanque_id = (g_cfg.tanque_id > 0) ? g_cfg.tanque_id : PROVISION_TANQUE_ID;
+
+    switch (tanque_id) {
+    case TANQUE_RD0_ID:
+        return BOMBA_PWM_RD0_ID;
+    case TANQUE_BOOSTER_ID:
+        return BOMBA_PWM_BOOSTER_ID;
+    default:
+        return 0;
+    }
+}
+
+bool tanque_bomba_eh_pwm(int bomba_id) {
+    int bomba_pwm_id = tanque_bomba_pwm_id();
+    return bomba_pwm_id > 0 && bomba_id == bomba_pwm_id;
+}
+
 size_t heap_total = 0;
 
 EventGroupHandle_t sys_event_group = NULL;

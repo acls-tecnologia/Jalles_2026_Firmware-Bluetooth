@@ -10,12 +10,15 @@ idf_component_register(SRCS
     "bluetooth.c"
     "tank_ble_config.c"
     "watchdog_rtc_raw.c"
+    "firmware_ota.c"
    
     INCLUDE_DIRS "."
     REQUIRES bt
              json
              nvs_flash
              esp_http_client
+             app_update
+             esp_https_ota
              esp_websocket_client
              esp_wifi
              esp_event

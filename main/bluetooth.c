@@ -28,7 +28,8 @@
 #define BLE_QUEUE_LEN 4
 
 typedef struct {
-    char data[BLE_RX_MAX_LEN + 1];
+    uint8_t data[BLE_RX_MAX_LEN + 1];
+    uint16_t length;
 } ble_rx_msg_t;
 
 static uint8_t own_addr_type;
@@ -98,7 +99,8 @@ static void ble_rx_task(void *arg) {
 
     while (1) {
         if (xQueueReceive(ble_rx_queue, &msg, portMAX_DELAY) == pdTRUE) {
-            tank_ble_config_handle_message(msg.data, bluetooth_send_message);
+            msg.data[msg.length] = '\0';
+            tank_ble_config_handle_message((const char *)msg.data, bluetooth_send_message);
         }
     }
 }
@@ -230,6 +232,12 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble
         }
 
         msg.data[len] = '\0';
+        msg.length = len;
+
+        if (msg.data[0] == 0xA1) {
+            tank_ble_config_handle_binary(msg.data, msg.length, bluetooth_send_message);
+            return 0;
+        }
 
         if (xQueueSend(ble_rx_queue, &msg, 0) != pdTRUE) {
             set_status("{\"ok\":false,\"error\":\"queue_full\"}");
